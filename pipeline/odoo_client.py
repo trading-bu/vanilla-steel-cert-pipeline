@@ -48,11 +48,11 @@ def get_neutralisation_data(vs_po_number: str) -> dict:
     """
     print(f"[Odoo] Looking up data for PO: {vs_po_number}")
 
-    # 1. Find the purchase order
+    # 1. Find the purchase order (no sale_order_id — field doesn't exist in Odoo 19)
     po_records = _call(
         "purchase.order", "search_read",
         [[["name", "=", vs_po_number]]],
-        {"fields": ["id", "name", "sale_order_id"], "limit": 1}
+        {"fields": ["id", "name"], "limit": 1}
     )
     if not po_records:
         raise ValueError(f"No purchase order found in Odoo for '{vs_po_number}'")
@@ -61,13 +61,13 @@ def get_neutralisation_data(vs_po_number: str) -> dict:
     po_id = po["id"]
     print(f"[Odoo] Found PO id={po_id}")
 
-    # 2. Get purchase order lines (filtered by aoo_fast_number)
+    # 2. Get purchase order lines
     po_lines = _call(
         "purchase.order.line", "search_read",
         [[["order_id", "=", po_id]]],
         {"fields": [
             "id", "vs_article", "aoo_fast_number",
-            "original_supplier_article", "sale_order_id", "sale_line_id",
+            "original_supplier_article", "sale_line_id",
             "product_uom_qty"
         ]}
     )
@@ -90,42 +90,27 @@ def get_neutralisation_data(vs_po_number: str) -> dict:
     ]
     print(f"[Odoo] Found {len(vs_articles)} order line(s) with AOO fast number.")
 
-    # 3. Get the linked Sales Order
+    # 3. Get the linked Sales Order via sale_line_id on PO lines
     so_number = ""
     buyer_name = ""
     buyer_country = ""
 
-    # Try from PO header first (sale_order_id)
-    if po.get("sale_order_id"):
-        so_id = po["sale_order_id"][0]
-        so_records = _call(
-            "sale.order", "read", [[so_id]],
-            {"fields": ["name", "partner_id"]}
-        )
-        if so_records:
-            so_number = so_records[0].get("name", "")
-            partner_id = so_records[0].get("partner_id", [None])[0]
-            if partner_id:
-                partners = _call(
-                    "res.partner", "read", [[partner_id]],
-                    {"fields": ["name", "country_id"]}
-                )
-                if partners:
-                    buyer_name    = partners[0].get("name", "")
-                    country_field = partners[0].get("country_id")
-                    buyer_country = country_field[1] if country_field else ""
-
-    # Fallback: try from first matching PO line's sale_order_id
-    if not so_number and po_lines:
-        for line in po_lines:
-            if line.get("sale_order_id"):
-                so_id = line["sale_order_id"][0]
+    for line in po_lines:
+        if line.get("sale_line_id"):
+            sale_line_id = line["sale_line_id"][0]
+            # sale.order.line → order_id gives the SO
+            sol = _call(
+                "sale.order.line", "read", [[sale_line_id]],
+                {"fields": ["order_id"]}
+            )
+            if sol and sol[0].get("order_id"):
+                so_id = sol[0]["order_id"][0]
                 so_records = _call(
                     "sale.order", "read", [[so_id]],
                     {"fields": ["name", "partner_id"]}
                 )
                 if so_records:
-                    so_number = so_records[0].get("name", "")
+                    so_number  = so_records[0].get("name", "")
                     partner_id = so_records[0].get("partner_id", [None])[0]
                     if partner_id:
                         partners = _call(
@@ -136,7 +121,7 @@ def get_neutralisation_data(vs_po_number: str) -> dict:
                             buyer_name    = partners[0].get("name", "")
                             country_field = partners[0].get("country_id")
                             buyer_country = country_field[1] if country_field else ""
-                break
+                break  # Found SO from first matched line — stop
 
     print(f"[Odoo] SO={so_number}, Buyer={buyer_name}, Country={buyer_country}")
 
