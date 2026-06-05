@@ -10,7 +10,7 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
-SCOPES = ["https://www.googleapis.com/auth/drive.file"]
+SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 _service = None
 
@@ -46,10 +46,14 @@ def upload_pdf(pdf_bytes: bytes, filename: str, folder_id: str) -> str:
     }
     media = MediaIoBaseUpload(BytesIO(pdf_bytes), mimetype="application/pdf", resumable=False)
 
+    # supportsAllDrives=True is required for Shared Drives.
+    # Service accounts have no personal storage quota, so the target folder
+    # MUST be a Shared Drive (not a regular My Drive folder).
     file = _service.files().create(
         body=metadata,
         media_body=media,
-        fields="id, webViewLink"
+        fields="id, webViewLink",
+        supportsAllDrives=True,
     ).execute()
 
     file_url = file.get("webViewLink", "")
