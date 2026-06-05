@@ -10,10 +10,13 @@ CERT_DOC_TYPE    = "others__IfrSa"
 
 
 def _headers():
+    # Full browser-like headers — required for Docsumo's Cloudflare-protected endpoints
     return {
-        "apikey": DOCSUMO_API_KEY,
-        "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0",
+        "apikey":          DOCSUMO_API_KEY,
+        "Accept":          "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
+        "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                           "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     }
 
 
@@ -22,21 +25,32 @@ def set_api_key(key: str):
     DOCSUMO_API_KEY = key
 
 
-def list_reviewing_certs(limit: int = 50) -> list[dict]:
+def list_reviewing_certs(limit: int = 100) -> list[dict]:
     """
     Returns all cert documents currently in 'reviewing' status.
-    These are certs the user has checked and are ready to neutralise.
+    Docsumo's doc_type_id filter parameter is unreliable (returns 404),
+    so we fetch all documents and filter by type + status in Python.
     """
-    # Docsumo doesn't expose a reliable filter-by-status list endpoint
-    # via the public API, so we page through all docs and filter locally.
     url = f"{DOCSUMO_BASE_URL}/user/documents/"
-    params = {"doc_type_id": CERT_DOC_TYPE, "limit": limit}
+    # Do NOT pass doc_type_id as a query param — causes 404
+    params = {"limit": limit}
     resp = requests.get(url, headers=_headers(), params=params)
+
+    if resp.status_code == 404:
+        # Try alternate endpoint path used by some Docsumo versions
+        url = f"{DOCSUMO_BASE_URL}/documents/"
+        resp = requests.get(url, headers=_headers(), params=params)
+
     resp.raise_for_status()
 
     docs = resp.json().get("data", {}).get("documents", [])
-    reviewing = [d for d in docs if d.get("status") == "reviewing"]
-    print(f"[Docsumo] Found {len(reviewing)} cert(s) in 'reviewing' status.")
+    reviewing = [
+        d for d in docs
+        if d.get("status") == "reviewing"
+        and d.get("type") == CERT_DOC_TYPE
+    ]
+    print(f"[Docsumo] Fetched {len(docs)} total doc(s), "
+          f"{len(reviewing)} cert(s) in 'reviewing' status.")
     return reviewing
 
 
