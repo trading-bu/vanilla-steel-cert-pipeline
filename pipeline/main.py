@@ -144,25 +144,64 @@ def main():
 
             print(f"  VS PO: {po_number}")
 
-            # ── 2. Download original PDF from Docsumo ──────────────────────────
+            # ── 2. Download original PDF from Docsumo (best-effort) ────────────
             print("  Downloading original PDF from Docsumo...")
-            pdf_bytes = docsumo.download_cert_pdf(doc_id)
-            print(f"  PDF downloaded: {len(pdf_bytes):,} bytes")
+            pdf_bytes = None
+            try:
+                pdf_bytes = docsumo.download_cert_pdf(doc_id)
+                print(f"  PDF downloaded: {len(pdf_bytes):,} bytes")
+            except Exception as dl_err:
+                print(f"  WARNING: PDF download failed ({dl_err.__class__.__name__}: {dl_err}). "
+                      "Continuing with Docsumo-only extraction.")
 
             # ── 3. Parse multi-coil data from PDF ─────────────────────────────
-            print("  Parsing certificate (pdfplumber)...")
-            parsed_cert = parser.parse_cert(pdf_bytes)
-            fmt         = parsed_cert.get("supplier_format", "unknown")
-            n_coils     = len(parsed_cert.get("coils", []))
-            print(f"  Format: {fmt} | Coils found: {n_coils}")
-
-            if n_coils == 0:
-                print("  WARNING: No coils parsed from PDF. Check cert_parser for this format.")
+            if pdf_bytes:
+                print("  Parsing certificate (pdfplumber)...")
+                parsed_cert = parser.parse_cert(pdf_bytes)
+                fmt         = parsed_cert.get("supplier_format", "unknown")
+                n_coils     = len(parsed_cert.get("coils", []))
+                print(f"  Format: {fmt} | Coils found: {n_coils}")
+                if n_coils == 0:
+                    print("  WARNING: No coils parsed from PDF. Check cert_parser for this format.")
+            else:
+                # No PDF available — build parsed_cert directly from Docsumo fields
+                h    = cert_header
+                dm   = h.get("mechanical") or {}
+                mech = None
+                if dm.get("rm"):
+                    mech = {
+                        "cond":    "F",
+                        "dir":     "L",
+                        "rp02":    int(dm["reh"])   if dm.get("reh")  else None,
+                        "rm":      int(dm["rm"]),
+                        "a_pct":   float(dm["a80"]) if dm.get("a80") else None,
+                        "rp02_rm": None,
+                    }
+                heat  = h.get("heat_number", "")
+                chems = {k: v for k, v in (h.get("chemicals") or {}).items() if v is not None}
+                parsed_cert = {
+                    "supplier_format": "docsumo",
+                    "cert_date":       h.get("cert_date", ""),
+                    "cert_number":     h.get("cert_number", ""),
+                    "cert_type":       h.get("cert_type", "EN 10204 3.1"),
+                    "grade":           h.get("grade", ""),
+                    "material_type":   h.get("material_type", ""),
+                    "total_weight_kg": h.get("weight_kg"),
+                    "coils": [{
+                        "cast_no":    heat,
+                        "pack_nr":    heat,
+                        "coil_no":    heat,
+                        "weight_kg":  h.get("weight_kg"),
+                        "chemicals":  chems,
+                        "mechanical": mech,
+                    }],
+                }
+                n_coils = 1
+                print("  [Docsumo-only] Cert built from Docsumo extraction (no original PDF).")
 
             # ── 3b. Docsumo fallback for empty chemistry / mechanical ──────────
-            # For formats cert_parser doesn't fully handle (e.g. Schaefer-Werke),
-            # fill missing per-coil data from Docsumo's own field extraction.
-            if n_coils > 0:
+            # Only applies when PDF was parsed — fills gaps cert_parser missed.
+            if pdf_bytes and n_coils > 0:
                 coil = parsed_cert["coils"][0]
 
                 # Chemistry: fall back if cert_parser returned an empty dict

@@ -51,14 +51,6 @@ def list_reviewing_certs(limit: int = 100) -> list[dict]:
     ]
     print(f"[Docsumo] Fetched {len(docs)} total doc(s), "
           f"{len(reviewing)} cert(s) in 'reviewing' status.")
-    # DEBUG: print download-relevant fields
-    if reviewing:
-        d0 = reviewing[0]
-        print(f"[Docsumo][DEBUG] s3_filename   : {d0.get('s3_filename')}")
-        print(f"[Docsumo][DEBUG] review_url    : {d0.get('review_url')}")
-        print(f"[Docsumo][DEBUG] review_token  : {d0.get('review_token')}")
-        print(f"[Docsumo][DEBUG] user_doc_id   : {d0.get('user_doc_id')}")
-        print(f"[Docsumo][DEBUG] preview_image : {d0.get('preview_image')}")
     return reviewing
 
 
