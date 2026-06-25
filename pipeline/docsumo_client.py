@@ -51,11 +51,14 @@ def list_reviewing_certs(limit: int = 100) -> list[dict]:
     ]
     print(f"[Docsumo] Fetched {len(docs)} total doc(s), "
           f"{len(reviewing)} cert(s) in 'reviewing' status.")
-    # DEBUG: log all keys in the first doc object so we can find the file URL field
+    # DEBUG: print download-relevant fields
     if reviewing:
-        import json as _json
-        print(f"[Docsumo][DEBUG] First doc keys: {list(reviewing[0].keys())}")
-        print(f"[Docsumo][DEBUG] First doc (truncated): {_json.dumps(reviewing[0])[:500]}")
+        d0 = reviewing[0]
+        print(f"[Docsumo][DEBUG] s3_filename   : {d0.get('s3_filename')}")
+        print(f"[Docsumo][DEBUG] review_url    : {d0.get('review_url')}")
+        print(f"[Docsumo][DEBUG] review_token  : {d0.get('review_token')}")
+        print(f"[Docsumo][DEBUG] user_doc_id   : {d0.get('user_doc_id')}")
+        print(f"[Docsumo][DEBUG] preview_image : {d0.get('preview_image')}")
     return reviewing
 
 
