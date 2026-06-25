@@ -76,7 +76,10 @@ def _parse_cert_data(raw: dict) -> dict:
         return raw.get(section, {}).get(field, {}).get("value", "") or ""
 
     def chem(element):
-        return raw.get("Chemical Composition", {}).get(f"{element} actual", {}).get("value") or None
+        # Use explicit None check — don't use `or None` which drops valid 0.0 values
+        field = raw.get("Chemical Composition", {}).get(f"{element} actual", {})
+        v = field.get("value")
+        return v if v is not None else None
 
     def mech(field):
         return raw.get("Mechanical Properties", {}).get(field, {}).get("value") or None
@@ -109,7 +112,9 @@ def _parse_cert_data(raw: dict) -> dict:
         "grade":              val("Product Details", "Grade"),
         "material_type":      val("Product Details", "Material Type"),
         "dimensions":         val("Product Details", "Dimensions"),
-        "heat_number":        val("Product Details", "Supplier Coil Number") or "",
+        # Field was renamed; try new name first, fall back to old for safety
+        "heat_number":        (val("Product Details", "Heat / Charge Number")
+                               or val("Product Details", "Supplier Coil Number") or ""),
         "weight_kg":          weight_kg,
 
         # Chemicals (all as floats or None)
@@ -127,6 +132,7 @@ def _parse_cert_data(raw: dict) -> dict:
             "B":  chem("B"),
             "Ti": chem("Ti"),
             "V":  chem("V"),
+            "Nb": chem("Nb"),
         },
 
         # Mechanical (None if not in cert)
@@ -136,6 +142,41 @@ def _parse_cert_data(raw: dict) -> dict:
             "a80":   mech("A80 actual"),
         },
     }
+
+
+def download_cert_pdf(doc_id: str) -> bytes:
+    """
+    Download the original PDF for a Docsumo document.
+    Returns raw PDF bytes.
+    """
+    # Try the standard download endpoint
+    url = f"{DOCSUMO_BASE_URL}/download/{doc_id}/"
+    resp = requests.get(url, headers=_headers())
+
+    if resp.status_code == 404:
+        # Some Docsumo versions use /documents/{doc_id}/download/
+        url = f"{DOCSUMO_BASE_URL}/documents/{doc_id}/download/"
+        resp = requests.get(url, headers=_headers())
+
+    resp.raise_for_status()
+
+    # Response may be a JSON wrapper with a URL, or raw PDF bytes
+    ct = resp.headers.get("Content-Type", "")
+    if "application/json" in ct:
+        data = resp.json()
+        pdf_url = (
+            data.get("data", {}).get("url")
+            or data.get("data", {}).get("download_url")
+            or data.get("url")
+        )
+        if not pdf_url:
+            raise RuntimeError(f"No PDF URL in Docsumo download response: {data}")
+        pdf_resp = requests.get(pdf_url, headers=_headers())
+        pdf_resp.raise_for_status()
+        return pdf_resp.content
+
+    # Raw PDF bytes
+    return resp.content
 
 
 # Docsumo status is never changed by this pipeline.
