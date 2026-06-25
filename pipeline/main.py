@@ -27,6 +27,7 @@ import odoo_client    as odoo
 import pdf_generator  as pdf
 import drive_client   as drive
 import cert_parser    as parser
+import po_log
 
 
 # ─── Config ───────────────────────────────────────────────────────────────────
@@ -46,6 +47,36 @@ def save_processed_ids(ids: set):
     with open(TRACKING_FILE, "w") as f:
         json.dump(sorted(ids), f, indent=2)
     print(f"[Tracker] {len(ids)} processed ID(s) saved.")
+
+
+def _find_cert_coil_for_odoo_item(cert_coils: list, odoo_weight_kg: float | None,
+                                   tolerance_kg: float = 100) -> dict:
+    """
+    Find the cert coil that best matches a specific Odoo line item by weight.
+
+    Handles the case where a supplier cert covers MORE coils than VS bought.
+    Example: supplier cert has 3 coils from the same heat; VS bought only 1.
+    → identify which cert coil belongs to our Odoo item; ignore the other 2.
+
+    Returns the best-matching coil dict, or cert_coils[0] as a fallback.
+    """
+    if not cert_coils:
+        return {}
+    if len(cert_coils) == 1:
+        return cert_coils[0]
+    if not odoo_weight_kg:
+        return cert_coils[0]
+
+    candidates = [
+        c for c in cert_coils
+        if c.get("weight_kg") is not None
+        and abs(c["weight_kg"] - odoo_weight_kg) <= tolerance_kg
+    ]
+    if candidates:
+        return min(candidates, key=lambda c: abs(c["weight_kg"] - odoo_weight_kg))
+
+    # No weight match — fall back to first coil
+    return cert_coils[0]
 
 
 def _apply_aoo_filter(parsed_cert: dict, odoo_data: dict) -> list:
@@ -108,6 +139,9 @@ def main():
 
     already_processed = load_processed_ids()
     print(f"[Tracker] {len(already_processed)} cert(s) already processed.")
+
+    po_log_data = po_log.load()
+    print(po_log.summary(po_log_data))
 
     all_certs = docsumo.list_reviewing_certs()
     certs     = [c for c in all_certs if c["doc_id"] not in already_processed]
@@ -246,10 +280,86 @@ def main():
             so_number = odoo_data.get("so_number", "UNKNOWN")
             print(f"  SO: {so_number} | Buyer: {odoo_data.get('buyer_name')}")
 
-            # ── 5. Apply AOO filter — select coils that are in this order ──────
-            filtered_coils = _apply_aoo_filter(parsed_cert, odoo_data)
+            # ── 5. PO log: register order + match cert to specific item(s) ─────
+            #
+            # First time we see this PO, all line items (with weights from Odoo)
+            # are written to po_log.json.  Subsequent certs for the same PO use
+            # the log to find still-unmatched items.
+            #
+            # Matching priority:
+            #   1. Heat number (idempotent re-run safety)
+            #   2. Weight: cert_weight ≈ item weight_t × 1000  (±100 kg)
+            #   3. Fallback: all unmatched items
+            #
+            po_entry = po_log.ensure_po(po_log_data, po_number, odoo_data)
+
+            cert_heat      = (cert_header.get("heat_number") or "").strip() or None
+            cert_weight_kg = (cert_header.get("weight_kg")
+                              or parsed_cert.get("total_weight_kg"))
+
+            matched_items = po_log.find_matching_items(
+                po_entry, cert_weight_kg, cert_heat
+            )
+            print(f"  Matched {len(matched_items)} PO line item(s) for this cert.")
+
+            # Build one coil row per matched Odoo item.
+            #
+            # Bi-directional matching:
+            #   • po_log already narrowed Odoo items → only items this cert covers
+            #   • _find_cert_coil_for_odoo_item() picks the right cert coil when the
+            #     supplier cert covers MORE coils than VS bought (e.g. supplier cert
+            #     has 3 coils but we only purchased 1 → ignore the other 2)
+            #
+            # Data sources:
+            #   • Chemistry + mechanical  → from the matched cert coil
+            #   • VSI article + weight    → from Odoo (authoritative)
+            #   • Grade + dimensions      → from Odoo product (if configured)
+            cert_coils     = parsed_cert.get("coils") or [{}]
+            filtered_coils = []
+
+            for item in matched_items:
+                odoo_wt_kg = round(item["weight_t"] * 1000) if item.get("weight_t") else None
+
+                # Pick the cert coil whose weight matches this Odoo item
+                cert_coil = _find_cert_coil_for_odoo_item(cert_coils, odoo_wt_kg)
+
+                coil = dict(cert_coil)          # copy chem + mechanical from cert
+                coil["vs_article"]   = item["vsi_id"]
+                coil["pack_nr"]      = cert_heat or cert_coil.get("pack_nr", "")
+                coil["cast_no"]      = cert_heat or cert_coil.get("cast_no", "")
+                coil["coil_no"]      = cert_heat or cert_coil.get("coil_no", "")
+                coil["weight_kg"]    = odoo_wt_kg or cert_coil.get("weight_kg")
+
+                # Enrich from Odoo — fills columns the supplier cert doesn't have
+                if item.get("width_mm"):
+                    coil["width_mm"]     = item["width_mm"]
+                if item.get("thickness_mm"):
+                    coil["thickness_mm"] = item["thickness_mm"]
+
+                # Grade: prefer cert → Odoo product field → Odoo product name
+                if not parsed_cert.get("grade"):
+                    if item.get("grade"):
+                        parsed_cert["grade"] = item["grade"]
+                    elif item.get("product_name"):
+                        # Log it so we can see what Odoo product names look like
+                        print(f"  [Odoo] Product name for grade inspection: '{item['product_name']}'")
+
+                # Material type / description for Section 1 of the cert
+                if not parsed_cert.get("material_type"):
+                    parsed_cert["material_type"] = (
+                        item.get("material_type")
+                        or item.get("description")
+                        or item.get("product_name")
+                        or ""
+                    )
+
+                filtered_coils.append(coil)
+
+            if not filtered_coils:
+                filtered_coils = [dict(cert_coils[0])] if cert_coils else [{}]
+
             parsed_cert["coils"] = filtered_coils
-            print(f"  Coils after AOO filter: {len(filtered_coils)}")
+            print(f"  Coils in output cert: {len(filtered_coils)}")
 
             # Merge Docsumo header into parsed_cert (cert_date, grade override if present)
             if cert_header.get("cert_date"):
@@ -271,6 +381,14 @@ def main():
             file_url    = drive.upload_pdf(out_bytes, filename, CUSTOMER_CERTS_FOLDER)
 
             newly_done.add(doc_id)
+
+            # Mark matched items in PO log and persist
+            po_log.mark_matched(
+                matched_items, cert_heat, doc_id,
+                cert_header.get("cert_date", "")
+            )
+            po_log.save(po_log_data)
+
             print(f"  ✅ Done — {filename}")
             print(f"     {file_url}")
             processed += 1
