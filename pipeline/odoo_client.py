@@ -68,7 +68,8 @@ def get_neutralisation_data(vs_po_number: str) -> dict:
         {"fields": [
             "id", "vs_article", "aoo_fast_number",
             "original_supplier_article", "sale_line_id",
-            "product_uom_qty", "name", "product_id"
+            "product_uom_qty", "name", "product_id",
+            "grade", "choice", "width", "thickness",
         ]}
     )
 
@@ -129,10 +130,11 @@ def get_neutralisation_data(vs_po_number: str) -> dict:
             # Description: prefer PO line name (purchaser-entered), fall back to product name
             "description":               (l.get("name") or prod_name or "").strip(),
             "product_name":              prod_name,
-            # Per-item details from Odoo product custom fields (empty if not configured)
-            "grade":        _prod_field(prod, "x_grade", "x_studio_grade"),
-            "width_mm":     _prod_field(prod, "x_width_mm", "x_studio_width_mm"),
-            "thickness_mm": _prod_field(prod, "x_thickness_mm", "x_studio_thickness_mm"),
+            # Per-item details — prefer PO line fields, fallback to product custom fields
+            "grade":        str(l.get("grade") or "").strip() or _prod_field(prod, "x_grade", "x_studio_grade"),
+            "quality":      str(l.get("choice") or "").strip(),   # Odoo field 'choice' = quality/yield class
+            "width_mm":     str(l.get("width") or "").strip() or _prod_field(prod, "x_width_mm", "x_studio_width_mm"),
+            "thickness_mm": str(l.get("thickness") or "").strip() or _prod_field(prod, "x_thickness_mm", "x_studio_thickness_mm"),
             "coating":      _prod_field(prod, "x_coating", "x_studio_coating"),
             "steelmaking":  _prod_field(prod, "x_steelmaking", "x_studio_steelmaking"),
             "material_type": _prod_field(prod, "x_material_type", "x_studio_material_type"),
@@ -143,8 +145,7 @@ def get_neutralisation_data(vs_po_number: str) -> dict:
         # Debug: show what Odoo product data looks like so we can tune field names
         sample = vs_articles[0]
         print(f"[Odoo] Sample line — description: '{sample['description']}' | "
-              f"product_name: '{sample['product_name']}' | "
-              f"grade: '{sample['grade']}' | "
+              f"grade: '{sample['grade']}' | quality: '{sample['quality']}' | "
               f"w×t: {sample['width_mm']}×{sample['thickness_mm']}")
 
     # 3. Get the linked Sales Order via sale_line_id on PO lines
