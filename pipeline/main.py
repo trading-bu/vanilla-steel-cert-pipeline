@@ -23,6 +23,22 @@ import sys
 from pathlib import Path
 
 import docsumo_client as docsumo
+
+
+def _safe_int(v):
+    """Convert v to int, return None on failure."""
+    try:
+        return int(float(str(v))) if v else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _safe_float(v):
+    """Convert v to float, return None on failure."""
+    try:
+        return float(str(v)) if v else None
+    except (ValueError, TypeError):
+        return None
 import odoo_client    as odoo
 import pdf_generator  as pdf
 import drive_client   as drive
@@ -167,7 +183,7 @@ def main():
         print(f"Processing: {doc_title}  (doc_id: {doc_id})")
 
         try:
-            # ── 1. Header fields from Docsumo ──────────────────────────────────
+            # ── 1. Header fields from Docsumo ────────────────────────────────────
             cert_header = docsumo.get_cert_data(doc_id)
             po_number   = cert_header.get("vs_po_number")
 
@@ -206,13 +222,14 @@ def main():
                     mech = {
                         "cond":    "F",
                         "dir":     "L",
-                        "rp02":    int(dm["reh"])   if dm.get("reh")  else None,
-                        "rm":      int(dm["rm"]),
-                        "a_pct":   float(dm["a80"]) if dm.get("a80") else None,
+                        "rp02":    _safe_int(dm.get("reh")),
+                        "rm":      _safe_int(dm.get("rm")),
+                        "a_pct":   _safe_float(dm.get("a80")),
                         "rp02_rm": None,
                     }
                 heat  = h.get("heat_number", "")
-                chems = {k: v for k, v in (h.get("chemicals") or {}).items() if v is not None}
+                chems = {k: v for k, v in (h.get("chemicals") or {}).items()
+                         if v is not None and v != ""}
                 parsed_cert = {
                     "supplier_format": "docsumo",
                     "cert_date":       h.get("cert_date", ""),
@@ -240,7 +257,7 @@ def main():
 
                 # Chemistry: fall back if cert_parser returned an empty dict
                 ds_chems = cert_header.get("chemicals") or {}
-                ds_chems = {k: v for k, v in ds_chems.items() if v is not None}
+                ds_chems = {k: v for k, v in ds_chems.items() if v is not None and v != ""}
                 if ds_chems and not any(v is not None for v in (coil.get("chemicals") or {}).values()):
                     coil["chemicals"] = ds_chems
                     print("  [Fallback] Chemistry filled from Docsumo extraction.")
@@ -331,18 +348,45 @@ def main():
                 coil["weight_kg"]    = odoo_wt_kg or cert_coil.get("weight_kg")
 
                 # Enrich from Odoo — fills columns the supplier cert doesn't have
-                if item.get("width_mm"):
-                    coil["width_mm"]     = item["width_mm"]
-                if item.get("thickness_mm"):
-                    coil["thickness_mm"] = item["thickness_mm"]
+                cert_w = cert_coil.get("width_mm") or ""
+                cert_t = cert_coil.get("thickness_mm") or ""
+                odoo_w = item.get("width_mm") or ""
+                odoo_t = item.get("thickness_mm") or ""
 
-                # Grade: prefer cert → Odoo product field → Odoo product name
+                # Width: supplier cert takes priority; Odoo is fallback; warn on mismatch
+                if cert_w and odoo_w and cert_w != odoo_w:
+                    try:
+                        if abs(float(cert_w) - float(odoo_w)) > 1.0:
+                            print(f"  ⚠️  Width mismatch for {item['vsi_id']}: "
+                                  f"cert={cert_w}mm, Odoo={odoo_w}mm")
+                    except (ValueError, TypeError):
+                        pass
+                coil["width_mm"] = cert_w or odoo_w or ""
+
+                # Thickness: supplier cert takes priority; Odoo is fallback; warn on mismatch
+                if cert_t and odoo_t and cert_t != odoo_t:
+                    try:
+                        if abs(float(cert_t) - float(odoo_t)) > 0.05:
+                            print(f"  ⚠️  Thickness mismatch for {item['vsi_id']}: "
+                                  f"cert={cert_t}mm, Odoo={odoo_t}mm")
+                    except (ValueError, TypeError):
+                        pass
+                coil["thickness_mm"] = cert_t or odoo_t or ""
+
+                # Grade and quality per-coil (for Section 2 table and Section 1 display)
+                coil["grade"]   = item.get("grade") or ""
+                coil["quality"] = item.get("quality") or ""
+
+                # Grade at cert level: prefer cert extraction → Odoo
                 if not parsed_cert.get("grade"):
                     if item.get("grade"):
                         parsed_cert["grade"] = item["grade"]
                     elif item.get("product_name"):
-                        # Log it so we can see what Odoo product names look like
                         print(f"  [Odoo] Product name for grade inspection: '{item['product_name']}'")
+
+                # Quality at cert level: from Odoo
+                if not parsed_cert.get("quality") and item.get("quality"):
+                    parsed_cert["quality"] = item["quality"]
 
                 # Material type / description for Section 1 of the cert
                 if not parsed_cert.get("material_type"):
