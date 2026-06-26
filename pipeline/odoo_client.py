@@ -2,7 +2,9 @@
 Odoo XML-RPC client for the certificate neutralisation pipeline.
 Looks up Sales Order, buyer country, and VS article numbers from a VS PO number.
 """
+import re
 import xmlrpc.client
+from datetime import datetime, timedelta
 
 ODOO_URL      = "https://erp.ops.vanillasteel.com"
 ODOO_DB       = "vanillasteel-main-22503126"
@@ -37,6 +39,121 @@ def _call(model: str, method: str, args: list, kwargs: dict = None):
     return _models.execute_kw(ODOO_DB, _uid, ODOO_API_KEY, model, method, args, kwargs or {})
 
 
+# ─── Spec normalisation (for cross-field grade/form/finish/coating matching) ──
+
+_FINISH_NORM = {
+    "HR": "HOTROLLED", "HOTROLLED": "HOTROLLED",
+    "CR": "COLDROLLED", "COLDROLLED": "COLDROLLED",
+    "HDG": "GALVANIZED", "GA": "GALVANIZED", "GI": "GALVANIZED",
+    "GALVANIZED": "GALVANIZED", "GALVANISED": "GALVANIZED",
+    "EG": "ELECTROGALVANIZED", "ELECTROGALVANIZED": "ELECTROGALVANIZED",
+    "PP": "PICKLEDOILED", "PO": "PICKLEDOILED",
+}
+_FORM_NORM = {
+    "COIL": "COIL", "COILS": "COIL", "COL": "COIL", "COLS": "COIL",
+    "SLITCOIL": "COIL", "SLITTEDCOIL": "COIL", "SLITSTRIP": "COIL",
+    "SHEET": "SHEET", "SHEETS": "SHEET",
+    "PLATE": "PLATE", "PLATES": "PLATE",
+    "FLATBAR": "FLATBAR", "STRIP": "STRIP",
+}
+
+
+def _norm(s: str) -> str:
+    return re.sub(r"[\s\-_\.\/]+", "", (s or "")).upper()
+
+
+def _spec_tokens(s: str) -> set:
+    """
+    Normalise and split a composite steel spec into searchable tokens.
+    'DX51D+Z275'  → {'DX51D+Z275', 'DX51D', 'Z275'}
+    'Cold Rolled'  → {'COLDROLLED', 'CR'}   (via _FINISH_NORM reverse)
+    'HR Coil'      → {'HOTROLLED', 'COIL'}
+    """
+    raw = _norm(s)
+    tokens = {raw} if raw else set()
+    for part in re.split(r"[+\-/]", raw):
+        part = part.strip()
+        if len(part) >= 2:
+            tokens.add(part)
+            if part in _FINISH_NORM:
+                tokens.add(_FINISH_NORM[part])
+            if part in _FORM_NORM:
+                tokens.add(_FORM_NORM[part])
+    return tokens - {""}
+
+
+def _choice_norm(s: str) -> str | None:
+    """'first choice', '1st', '1', 'first' → '1';  'second' → '2'."""
+    s = re.sub(r"[\s_\-]+", "", (s or "").lower())
+    if re.search(r"first|1st|^1$|^1choice", s):
+        return "1"
+    if re.search(r"second|2nd|^2$|^2choice", s):
+        return "2"
+    return None
+
+
+def _score_line(line: dict, cert: dict) -> int:
+    """
+    Score an Odoo PO line against cert signals.  Max = 13.
+
+    line keys expected: weight_t, grade, choice, form, finish, coating,
+                        width_mm, thickness_mm
+    cert keys expected: weight_kg, grade, material_type, quality,
+                        width_mm, thickness_mm
+    """
+    score = 0
+
+    # ── Weight (most discriminating) — max 5 pts ──────────────────────────
+    odoo_kg = (line.get("weight_t") or 0) * 1000
+    cert_kg  = cert.get("weight_kg") or 0
+    if odoo_kg > 0 and cert_kg > 0:
+        pct = abs(odoo_kg - cert_kg) / odoo_kg
+        if   pct <= 0.02: score += 5
+        elif pct <= 0.05: score += 3
+        elif pct <= 0.10: score += 1
+
+    # ── Grade / spec cross-match — max 3 pts ──────────────────────────────
+    # Pool ALL spec-like Odoo fields: grade, form, finish, coating.
+    # Any of these might appear under "grade" on a supplier cert.
+    odoo_tok: set = set()
+    for f in ("grade", "form", "finish", "coating"):
+        odoo_tok |= _spec_tokens(line.get(f) or "")
+
+    # Pool cert's spec fields (Docsumo grade, material_type, quality).
+    cert_tok: set = set()
+    for f in ("grade", "material_type", "quality"):
+        cert_tok |= _spec_tokens(cert.get(f) or "")
+
+    if odoo_tok and cert_tok and (odoo_tok & cert_tok):
+        score += 3
+
+    # ── Choice / quality match — max 1 pt ─────────────────────────────────
+    odoo_ch = _choice_norm(line.get("choice") or "")
+    cert_ch  = _choice_norm(cert.get("quality") or "")
+    if odoo_ch and cert_ch and odoo_ch == cert_ch:
+        score += 1
+
+    # ── Width — max 2 pts ─────────────────────────────────────────────────
+    try:
+        ow = float(line.get("width_mm") or 0)
+        cw = float(cert.get("width_mm") or 0)
+        if ow > 0 and cw > 0 and abs(ow - cw) <= 2:
+            score += 2
+    except (ValueError, TypeError):
+        pass
+
+    # ── Thickness — max 2 pts ─────────────────────────────────────────────
+    try:
+        ot = float(line.get("thickness_mm") or 0)
+        ct = float(cert.get("thickness_mm") or 0)
+        if ot > 0 and ct > 0 and abs(ot - ct) <= 0.1:
+            score += 2
+    except (ValueError, TypeError):
+        pass
+
+    return score
+
+
 def get_neutralisation_data(vs_po_number: str) -> dict:
     """
     Given a VS Purchase Order number (e.g. 'P01655'), returns:
@@ -69,7 +186,8 @@ def get_neutralisation_data(vs_po_number: str) -> dict:
             "id", "vs_article", "aoo_fast_number",
             "original_supplier_article", "sale_line_id",
             "product_uom_qty", "name", "product_id",
-            "grade", "choice", "width", "thickness",
+            "grade", "choice", "form", "finish", "coating",
+            "width", "thickness",
         ]}
     )
 
@@ -135,7 +253,9 @@ def get_neutralisation_data(vs_po_number: str) -> dict:
             "quality":      str(l.get("choice") or "").strip(),   # Odoo field 'choice' = quality/yield class
             "width_mm":     str(l.get("width") or "").strip() or _prod_field(prod, "x_width_mm", "x_studio_width_mm"),
             "thickness_mm": str(l.get("thickness") or "").strip() or _prod_field(prod, "x_thickness_mm", "x_studio_thickness_mm"),
-            "coating":      _prod_field(prod, "x_coating", "x_studio_coating"),
+            "form":         str(l.get("form") or "").strip(),
+            "finish":       str(l.get("finish") or "").strip(),
+            "coating":      str(l.get("coating") or "").strip() or _prod_field(prod, "x_coating", "x_studio_coating"),
             "steelmaking":  _prod_field(prod, "x_steelmaking", "x_studio_steelmaking"),
             "material_type": _prod_field(prod, "x_material_type", "x_studio_material_type"),
         })
@@ -189,3 +309,76 @@ def get_neutralisation_data(vs_po_number: str) -> dict:
         "buyer_country": buyer_country,
         "vs_articles":  vs_articles,
     }
+
+
+def find_po_for_cert(cert_signals: dict) -> tuple:
+    """
+    When no PO number appears on a supplier cert, search all confirmed PO lines
+    from the last 60 days and score them against the cert's signals.
+
+    cert_signals keys:
+        weight_kg    — total cert weight in kg (float)
+        grade        — grade string from cert/Docsumo
+        material_type— material description
+        quality      — quality/choice string
+        width_mm     — width as string
+        thickness_mm — thickness as string
+
+    Returns:
+        (best_po_number, best_score, candidates)
+        candidates: list of (po_number, score, vsi_article) sorted by score desc
+                    only candidates scoring >= 4 are included
+    """
+    since = (datetime.utcnow() - timedelta(days=60)).strftime("%Y-%m-%d %H:%M:%S")
+
+    # Step 1: IDs of all confirmed POs in the last 60 days
+    po_ids = _call(
+        "purchase.order", "search",
+        [[["state", "in", ["purchase", "done"]], ["date_order", ">=", since]]]
+    )
+    if not po_ids:
+        print("[Odoo] No confirmed POs in last 60 days — cannot auto-match.")
+        return None, 0, []
+
+    # Step 2: All PO lines for those POs that have a VSI article
+    lines = _call(
+        "purchase.order.line", "search_read",
+        [[["order_id", "in", po_ids], ["vs_article", "!=", False]]],
+        {"fields": [
+            "id", "order_id", "vs_article",
+            "product_uom_qty",                    # weight in tonnes
+            "grade", "choice", "form", "finish", "coating",
+            "width", "thickness",
+        ]}
+    )
+    print(f"[Odoo] Auto-match: scoring {len(lines)} PO line(s) against cert signals...")
+
+    raw_candidates = []
+    for line in lines:
+        # Normalise field names to match _score_line expectations
+        line["weight_t"]     = line.get("product_uom_qty")
+        line["width_mm"]     = str(line.get("width")     or "").strip()
+        line["thickness_mm"] = str(line.get("thickness") or "").strip()
+
+        s = _score_line(line, cert_signals)
+        if s >= 4:
+            po_ref = (line["order_id"][1]
+                      if isinstance(line.get("order_id"), list)
+                      else str(line.get("order_id", "")))
+            raw_candidates.append((po_ref, s, line.get("vs_article", "–")))
+
+    # Keep best-scoring line per PO (a PO may have multiple lines)
+    best_per_po: dict[str, tuple] = {}
+    for po_ref, score, vsi in sorted(raw_candidates, key=lambda x: x[1], reverse=True):
+        if po_ref not in best_per_po or best_per_po[po_ref][0] < score:
+            best_per_po[po_ref] = (score, vsi)
+
+    candidates = sorted(
+        [(po, sc, vsi) for po, (sc, vsi) in best_per_po.items()],
+        key=lambda x: x[1], reverse=True,
+    )
+
+    if not candidates:
+        return None, 0, []
+
+    return candidates[0][0], candidates[0][1], candidates

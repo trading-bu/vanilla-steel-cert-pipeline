@@ -183,18 +183,13 @@ def main():
         print(f"Processing: {doc_title}  (doc_id: {doc_id})")
 
         try:
-            # ── 1. Header fields from Docsumo ────────────────────────────────────
+            # ── 1. Header fields from Docsumo ──────────────────────────────────
             cert_header = docsumo.get_cert_data(doc_id)
             po_number   = cert_header.get("vs_po_number")
 
-            if not po_number:
-                print(f"  SKIP — No VS PO number found for {doc_title}.")
-                errors += 1
-                continue
-
-            print(f"  VS PO: {po_number}")
-
             # ── 2. Download original PDF from Docsumo (best-effort) ────────────
+            # Done before PO lookup so width/thickness from the PDF can be used
+            # for auto-matching when the cert carries no PO number.
             print("  Downloading original PDF from Docsumo...")
             pdf_bytes = None
             try:
@@ -291,6 +286,49 @@ def main():
                 # Grade / material type
                 if cert_header.get("material_type") and not parsed_cert.get("material_type"):
                     parsed_cert["material_type"] = cert_header["material_type"]
+
+            # ── 3c. PO number — from Docsumo, or auto-matched from cert signals ─
+            if not po_number:
+                print("  No PO number on cert — running auto-match against Odoo...")
+                first_coil = (parsed_cert.get("coils") or [{}])[0]
+                cert_signals = {
+                    "weight_kg":    (cert_header.get("weight_kg")
+                                     or parsed_cert.get("total_weight_kg")),
+                    "grade":        (cert_header.get("grade")
+                                     or parsed_cert.get("grade") or ""),
+                    "material_type": (cert_header.get("material_type")
+                                      or parsed_cert.get("material_type") or ""),
+                    "quality":      cert_header.get("quality", ""),
+                    "width_mm":     first_coil.get("width_mm", ""),
+                    "thickness_mm": first_coil.get("thickness_mm", ""),
+                }
+                po_number, confidence, candidates = odoo.find_po_for_cert(cert_signals)
+
+                if po_number and confidence >= 8:
+                    runner_up = candidates[1][1] if len(candidates) > 1 else 0
+                    if confidence - runner_up >= 3:
+                        # Clear winner — auto-assign
+                        print(f"  ✅ Auto-matched to {po_number} (score: {confidence})")
+                    else:
+                        print(f"  ⚠️  Ambiguous match — top candidates:")
+                        for p, s, v in candidates[:3]:
+                            print(f"      {p}  score={s}  article={v}")
+                        print("  SKIP — Set vs_po_number in Docsumo and re-run.")
+                        errors += 1
+                        continue
+                elif candidates:
+                    print(f"  ⚠️  Low-confidence match (score={confidence}) — top candidates:")
+                    for p, s, v in candidates[:3]:
+                        print(f"      {p}  score={s}  article={v}")
+                    print("  SKIP — Set vs_po_number in Docsumo and re-run.")
+                    errors += 1
+                    continue
+                else:
+                    print("  SKIP — No matching PO found. Check cert manually.")
+                    errors += 1
+                    continue
+
+            print(f"  VS PO: {po_number}")
 
             # ── 4. Odoo lookup ─────────────────────────────────────────────────
             odoo_data = odoo.get_neutralisation_data(po_number)
