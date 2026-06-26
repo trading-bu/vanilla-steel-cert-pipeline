@@ -265,7 +265,7 @@ def _chem_header_para(elem: str, am_units: dict | None) -> Paragraph:
 
 def _fmt_chem(val, is_integer: bool) -> str:
     """Format a chemistry value for display."""
-    if val is None:
+    if val is None or val == "":
         return "–"
     if is_integer:
         return str(int(val))
