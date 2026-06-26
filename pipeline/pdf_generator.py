@@ -265,17 +265,20 @@ def _chem_header_para(elem: str, am_units: dict | None) -> Paragraph:
 
 def _fmt_chem(val, is_integer: bool) -> str:
     """Format a chemistry value for display."""
-    if val is None or val == "":
+    if val is None or (isinstance(val, str) and not val.strip()):
         return "–"
-    if is_integer:
-        return str(int(val))
-    # Decimal % — strip trailing zeros but keep enough precision
-    f = float(val)
-    if f == 0:
-        return "0"
-    # Show up to 4 sig figs
-    s = f"{f:.4f}".rstrip("0").rstrip(".")
-    return s
+    try:
+        if is_integer:
+            return str(int(float(val)))
+        # Decimal % — strip trailing zeros but keep enough precision
+        f = float(val)
+        if f == 0:
+            return "0"
+        # Show up to 4 sig figs
+        s = f"{f:.4f}".rstrip("0").rstrip(".")
+        return s
+    except (ValueError, TypeError):
+        return str(val)  # show raw value if unparseable
 
 
 # ─── Main generator ───────────────────────────────────────────────────────────
@@ -343,16 +346,19 @@ def _build_story(parsed_cert: dict, odoo_data: dict) -> list:
     elif thicknesses or widths:
         dim_s = "Mixed — see Shipped Positions"
 
+    grade_s   = parsed_cert.get("grade", "") or ""
+    quality_s = parsed_cert.get("quality", "") or ""
+    gq_s      = " / ".join(filter(None, [grade_s, quality_s])) or "–"
+
     kv_pairs = [
         ("Description of Goods",  parsed_cert.get("material_type", "–")),
         ("Type of Packages",       "Coil"),
         ("Standard",               parsed_cert.get("standard", "–")),
         ("Quantity",               f"{len(coils)} coil(s)"),
-        ("Grade / Quality",        parsed_cert.get("grade", "–")),
-        ("Steelmaking Process",    parsed_cert.get("steelmaking", "–") or "–"),
+        ("Grade / Quality",        gq_s),
         ("Dimensions",             dim_s or "–"),
         ("Total Gross Weight",     wt_s),
-        ("", ""), ("", ""),
+        ("", ""), ("", ""), ("", ""),
     ]
     story.append(_kv_grid(kv_pairs))
     story.append(Spacer(1, 4*mm))
@@ -377,24 +383,25 @@ def _build_story(parsed_cert: dict, odoo_data: dict) -> list:
                         "Width\n(mm)", "Thick.\n(mm)", "Qty", "Gross Wt.\n(kg)", "VS Article"]
         s2_weights  = [0.7, 2.5, 2.8, 1.2, 1.2, 0.7, 1.8, 2.0]
 
-    grade = parsed_cert.get("grade", "–")
+    cert_grade = parsed_cert.get("grade", "–") or "–"
     s2_rows = []
     for i, coil in enumerate(coils, 1):
         wk = coil.get("weight_kg")
         wks = f"{int(wk):,}" if wk else "–"
         vs  = coil.get("vs_article", "–")
+        coil_grade = coil.get("grade") or cert_grade or "–"
 
         if has_coil_no and has_cast_no:
             row = [i, coil.get("pack_nr","–"), coil.get("coil_no","–"),
-                   coil.get("cast_no","–"), grade,
+                   coil.get("cast_no","–"), coil_grade,
                    coil.get("width_mm","–"), coil.get("thickness_mm","–"),
                    coil.get("qty", 1), wks, vs]
         elif has_cast_no:
-            row = [i, coil.get("pack_nr","–"), coil.get("cast_no","–"), grade,
+            row = [i, coil.get("pack_nr","–"), coil.get("cast_no","–"), coil_grade,
                    coil.get("width_mm","–"), coil.get("thickness_mm","–"),
                    coil.get("qty", 1), wks, vs]
         else:
-            row = [i, coil.get("pack_nr","–"), grade,
+            row = [i, coil.get("pack_nr","–"), coil_grade,
                    coil.get("width_mm","–"), coil.get("thickness_mm","–"),
                    coil.get("qty", 1), wks, vs]
         s2_rows.append(row)
