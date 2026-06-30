@@ -2,5 +2,5 @@
 builder = "nixpacks"
 
 [deploy]
-startCommand = "uvicorn pipeline.api:app --host 0.0.0.0 --port $PORT"
+startCommand = "cd pipeline && uvicorn api:app --host 0.0.0.0 --port $PORT"
 healthcheckPath = "/health"
