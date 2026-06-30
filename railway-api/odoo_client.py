@@ -268,26 +268,15 @@ def get_neutralisation_data(vs_po_number: str) -> dict:
               f"grade: '{sample['grade']}' | quality: '{sample['quality']}' | "
               f"w×t: {sample['width_mm']}×{sample['thickness_mm']}")
 
-    # 3. Collect all sale_line_ids from PO lines (needed for delivery note matching)
-    sale_line_ids = [
-        l["sale_line_id"][0]
-        for l in po_lines
-        if l.get("sale_line_id") and isinstance(l["sale_line_id"], list)
-    ]
-
-    # 4. Get the linked Sales Order via sale_line_id on PO lines
-    so_number     = ""
-    so_id         = None
-    buyer_name    = ""
+    # 3. Get the linked Sales Order via sale_line_id on PO lines
+    so_number = ""
+    buyer_name = ""
     buyer_country = ""
-    buyer_address = ""
-    vs_reference  = ""
-    customer_po   = ""
-    delivery_note = ""
 
     for line in po_lines:
         if line.get("sale_line_id"):
             sale_line_id = line["sale_line_id"][0]
+            # sale.order.line → order_id gives the SO
             sol = _call(
                 "sale.order.line", "read", [[sale_line_id]],
                 {"fields": ["order_id"]}
@@ -296,84 +285,29 @@ def get_neutralisation_data(vs_po_number: str) -> dict:
                 so_id = sol[0]["order_id"][0]
                 so_records = _call(
                     "sale.order", "read", [[so_id]],
-                    {"fields": [
-                        "name",               # S01501 — the SO number
-                        "partner_id",         # billing contact
-                        "partner_shipping_id",# shipping address (buyer's warehouse)
-                        "client_order_ref",   # customer's own PO number
-                        "x_vs_reference",     # VSO number (custom field — may not exist)
-                    ]}
+                    {"fields": ["name", "partner_id"]}
                 )
                 if so_records:
-                    so   = so_records[0]
-                    so_number    = so.get("name", "")
-                    customer_po  = so.get("client_order_ref") or ""
-                    vs_reference = so.get("x_vs_reference") or so_number  # fall back to SO name
-
-                    # ── Shipping address ──────────────────────────────────────
-                    shipping_partner_id = (so.get("partner_shipping_id") or [None])[0]
-                    billing_partner_id  = (so.get("partner_id") or [None])[0]
-                    # Prefer shipping address; fall back to billing contact
-                    addr_id = shipping_partner_id or billing_partner_id
-                    if addr_id:
+                    so_number  = so_records[0].get("name", "")
+                    partner_id = so_records[0].get("partner_id", [None])[0]
+                    if partner_id:
                         partners = _call(
-                            "res.partner", "read", [[addr_id]],
-                            {"fields": ["name", "street", "street2",
-                                        "city", "zip", "country_id"]}
+                            "res.partner", "read", [[partner_id]],
+                            {"fields": ["name", "country_id"]}
                         )
                         if partners:
-                            p = partners[0]
-                            buyer_name    = p.get("name", "")
-                            country_field = p.get("country_id")
+                            buyer_name    = partners[0].get("name", "")
+                            country_field = partners[0].get("country_id")
                             buyer_country = country_field[1] if country_field else ""
-                            # Build a single-line address string
-                            parts = [
-                                p.get("street") or "",
-                                p.get("street2") or "",
-                                " ".join(filter(None, [p.get("zip", ""), p.get("city", "")])),
-                                buyer_country,
-                            ]
-                            buyer_address = ", ".join(p for p in parts if p)
-                break  # Found SO — stop
+                break  # Found SO from first matched line — stop
 
-    # 5. Delivery note: find done stock.picking records that contain our VSI lines
-    if so_id and sale_line_ids:
-        try:
-            # stock.move links sale_line_id → picking_id
-            moves = _call(
-                "stock.move", "search_read",
-                [[["sale_line_id", "in", sale_line_ids],
-                  ["state", "=", "done"]]],
-                {"fields": ["picking_id", "sale_line_id"]}
-            )
-            picking_ids = list({
-                m["picking_id"][0]
-                for m in moves
-                if m.get("picking_id") and isinstance(m["picking_id"], list)
-            })
-            if picking_ids:
-                pickings = _call(
-                    "stock.picking", "read",
-                    [picking_ids],
-                    {"fields": ["name", "state", "date_done"]}
-                )
-                done = [p["name"] for p in pickings if p.get("state") == "done"]
-                delivery_note = ", ".join(sorted(done))
-        except Exception as e:
-            print(f"[Odoo] WARNING: Could not fetch delivery notes: {e}")
-
-    print(f"[Odoo] SO={so_number} | VSO={vs_reference} | "
-          f"Buyer={buyer_name} | Delivery={delivery_note or '(pending)'}")
+    print(f"[Odoo] SO={so_number}, Buyer={buyer_name}, Country={buyer_country}")
 
     return {
-        "so_number":      so_number,
-                "vs_reference":   vs_reference,
-        "customer_po":    customer_po,
-        "buyer_name":     buyer_name,
-        "buyer_country":  buyer_country,
-        "buyer_address":  buyer_address,
-        "delivery_note":  delivery_note,
-        "vs_articles":    vs_articles,
+        "so_number":    so_number,
+        "buyer_name":   buyer_name,
+        "buyer_country": buyer_country,
+        "vs_articles":  vs_articles,
     }
 
 
@@ -397,6 +331,7 @@ def find_po_for_cert(cert_signals: dict) -> tuple:
     """
     since = (datetime.utcnow() - timedelta(days=60)).strftime("%Y-%m-%d %H:%M:%S")
 
+    # Step 1: IDs of all confirmed POs in the last 60 days
     po_ids = _call(
         "purchase.order", "search",
         [[["state", "in", ["purchase", "done"]], ["date_order", ">=", since]]]
@@ -405,12 +340,13 @@ def find_po_for_cert(cert_signals: dict) -> tuple:
         print("[Odoo] No confirmed POs in last 60 days — cannot auto-match.")
         return None, 0, []
 
+    # Step 2: All PO lines for those POs that have a VSI article
     lines = _call(
         "purchase.order.line", "search_read",
         [[["order_id", "in", po_ids], ["vs_article", "!=", False]]],
         {"fields": [
             "id", "order_id", "vs_article",
-            "product_uom_qty",
+            "product_uom_qty",                    # weight in tonnes
             "grade", "choice", "form", "finish", "coating",
             "width", "thickness",
         ]}
@@ -419,9 +355,11 @@ def find_po_for_cert(cert_signals: dict) -> tuple:
 
     raw_candidates = []
     for line in lines:
+        # Normalise field names to match _score_line expectations
         line["weight_t"]     = line.get("product_uom_qty")
         line["width_mm"]     = str(line.get("width")     or "").strip()
         line["thickness_mm"] = str(line.get("thickness") or "").strip()
+
         s = _score_line(line, cert_signals)
         if s >= 4:
             po_ref = (line["order_id"][1]
@@ -429,6 +367,7 @@ def find_po_for_cert(cert_signals: dict) -> tuple:
                       else str(line.get("order_id", "")))
             raw_candidates.append((po_ref, s, line.get("vs_article", "–")))
 
+    # Keep best-scoring line per PO (a PO may have multiple lines)
     best_per_po: dict[str, tuple] = {}
     for po_ref, score, vsi in sorted(raw_candidates, key=lambda x: x[1], reverse=True):
         if po_ref not in best_per_po or best_per_po[po_ref][0] < score:
