@@ -1,21 +1,19 @@
 """
 Vanilla Steel — Neutralised Inspection Certificate (EN 10204 3.1)
-Direction A — Light layout.
+Template v2 — multi-page landscape A4, matching HTML template.
 
-Design reference:
-  - White background, navy #000831 accent lines
-  - Masthead: logo + address left / title right / 2pt navy rule below
-  - Meta strip: 4 columns (cert no, date, standard, place)
-  - Middle: 3 columns (Consignee | Order references | Product)
-  - Chemical composition table (elements as columns, heats as rows)
-  - Bottom: 2 columns (Mechanical properties | Declaration + signature)
-
-Multi-coil handling:
-  - If >1 coil: adds a Delivery Details table between Middle and Chemical sections
-  - Chemistry and Mechanical tables always show all rows
+Sections (in order):
+  Meta strip   — 5-col: VS cert no | mill cert no | date | standard | insp type
+  Parties      — 3-col: Manufacturer | Consignee | Destination
+  Refs + Spec  — 2-col: Order references KV | Product specification KV
+  Items table  — per-coil: Item CoilNo Heat Serial Thick Width NetWt GrossWt Pcs
+  Mechanical   — per-coil: CoilNo Dir Cond Re Rm A Ratio Bend Coat
+  Chemical     — per-heat: Heat C Si Mn P S Al N Cu Cr Ni Nb Ti V Mo B
+  Declaration  — 2-col: declaration+remarks+footnote | signer+verifyCode
 """
 from io import BytesIO
-import os
+import os, hashlib
+from datetime import datetime
 
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib import colors
@@ -24,63 +22,70 @@ from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.enums import TA_LEFT, TA_RIGHT, TA_CENTER
 from reportlab.platypus import (
     BaseDocTemplate, Frame, PageTemplate,
-    Paragraph, Table, TableStyle, Spacer, HRFlowable, KeepTogether,
+    Paragraph, Table, TableStyle, Spacer, KeepTogether,
 )
 from reportlab.pdfgen import canvas as pdfcanvas
 
 
-# ── Palette (Direction A) ─────────────────────────────────────────────────────
+# ── Palette ──────────────────────────────────────────────────────────────────
 NAVY         = colors.HexColor("#000831")
-WHITE        = colors.white
 TEXT_DARK    = colors.HexColor("#11151f")
 TEXT_MED     = colors.HexColor("#4b515e")
+TEXT_MED2    = colors.HexColor("#5b6170")
+TEXT_MUTED2  = colors.HexColor("#6b7280")
 TEXT_MUTED   = colors.HexColor("#7b8290")
 LABEL_C      = colors.HexColor("#9aa0ac")
 BORDER_LIGHT = colors.HexColor("#eef0f3")
 BORDER_MED   = colors.HexColor("#e6e8ee")
 
-
 # ── Page geometry ─────────────────────────────────────────────────────────────
 PAGE_W, PAGE_H = landscape(A4)
-ML = MR = 14 * mm
-HEADER_H = 22 * mm
-FOOTER_H =  8 * mm
-CONTENT_W = PAGE_W - ML - MR
-FRAME_Y = FOOTER_H + 3 * mm
-FRAME_H = PAGE_H - HEADER_H - FOOTER_H - 5 * mm
+ML = MR       = 14 * mm
+MAST_H        = 20 * mm
+FOOT_H        = 11 * mm
+CONTENT_W     = PAGE_W - ML - MR
+FRAME_Y       = FOOT_H
+FRAME_H       = PAGE_H - MAST_H - FOOT_H
+
+# Chemical elements — fixed order from template
+CHEM_ELEMS = ["C","Si","Mn","P","S","Al","N","Cu","Cr","Ni","Nb","Ti","V","Mo","B"]
 
 
-# ── Text styles ───────────────────────────────────────────────────────────────
+# ── Styles ────────────────────────────────────────────────────────────────────
 def _s(name, **kw):
-    base = dict(fontName="Helvetica", fontSize=8, leading=10,
-                textColor=TEXT_DARK, spaceAfter=0, spaceBefore=0)
-    base.update(kw)
-    return ParagraphStyle(name, **base)
+    b = dict(fontName="Helvetica", fontSize=8, leading=10,
+             textColor=TEXT_DARK, spaceAfter=0, spaceBefore=0)
+    b.update(kw)
+    return ParagraphStyle(name, **b)
 
-S_LABEL  = _s("lbl",   fontSize=6.5,  textColor=LABEL_C,   leading=9)
-S_VAL    = _s("val",   fontSize=10.5, textColor=TEXT_DARK,  fontName="Helvetica-Bold", leading=13)
-S_BODY   = _s("body",  fontSize=8.5,  textColor=TEXT_MED,   leading=12)
-S_BODYB  = _s("bodb",  fontSize=8.5,  textColor=TEXT_DARK,  fontName="Helvetica-Bold", leading=12)
-S_GRADE  = _s("grd",   fontSize=12,   textColor=TEXT_DARK,  fontName="Helvetica-Bold", leading=15)
-S_MUTED  = _s("mut",   fontSize=8,    textColor=TEXT_MUTED, leading=11)
-S_DECL   = _s("dcl",   fontSize=8.5,  textColor=TEXT_MED,   leading=13)
-S_SIGNAM = _s("sgn",   fontSize=9.5,  textColor=TEXT_DARK,  fontName="Helvetica-Bold", leading=12)
-S_SIGROL = _s("sgr",   fontSize=8,    textColor=TEXT_MUTED, leading=10)
-S_NOTE   = _s("nte",   fontSize=7,    textColor=LABEL_C,    leading=9,  alignment=TA_RIGHT)
-S_THDR   = _s("thd",   fontSize=8,    textColor=TEXT_MED,   fontName="Helvetica-Bold",
-               leading=10, alignment=TA_CENTER)
-S_TCEN   = _s("tcn",   fontSize=8,    textColor=TEXT_DARK,  fontName="Helvetica-Bold",
-               leading=10, alignment=TA_CENTER)
-S_TCENR  = _s("tcr",   fontSize=8,    textColor=TEXT_DARK,  leading=10, alignment=TA_CENTER)
-S_TRIGHT = _s("trg",   fontSize=8,    textColor=TEXT_DARK,  fontName="Helvetica-Bold",
-               leading=10, alignment=TA_RIGHT)
-S_TRIGHTM= _s("trm",   fontSize=8,    textColor=TEXT_MUTED, leading=10, alignment=TA_RIGHT)
-S_TLEFT  = _s("tll",   fontSize=8,    textColor=TEXT_DARK,  leading=10)
-S_TLEFTB = _s("tlb",   fontSize=8,    textColor=TEXT_DARK,  fontName="Helvetica-Bold", leading=10)
-S_SECR   = _s("scr",   fontSize=7.5,  textColor=LABEL_C,    leading=9,  alignment=TA_RIGHT)
+S_LABEL  = _s("lbl",  fontSize=6.75, textColor=LABEL_C,    leading=9)
+S_META_V = _s("mtv",  fontSize=9.75, textColor=TEXT_DARK,  fontName="Helvetica-Bold", leading=12)
+S_PTY_N  = _s("ptn",  fontSize=9.75, textColor=TEXT_DARK,  fontName="Helvetica-Bold", leading=12)
+S_PTY_A  = _s("pta",  fontSize=8.6,  textColor=TEXT_MED,   leading=13)
+S_SEC    = _s("sec",  fontSize=8.25, textColor=TEXT_DARK,  fontName="Helvetica-Bold", leading=10)
+S_SEC_R  = _s("scr",  fontSize=7.5,  textColor=LABEL_C,    leading=9,  alignment=TA_RIGHT)
+S_KV_K   = _s("kvk",  fontSize=8.6,  textColor=TEXT_MUTED2, leading=11)
+S_KV_V   = _s("kvv",  fontSize=8.6,  textColor=TEXT_DARK,  fontName="Helvetica-Bold", leading=11, alignment=TA_RIGHT)
+S_TH     = _s("thd",  fontSize=8.25, textColor=TEXT_MED2,  fontName="Helvetica-Bold", leading=10)
+S_TH_C   = _s("thc",  fontSize=8.25, textColor=TEXT_MED2,  fontName="Helvetica-Bold", leading=10, alignment=TA_CENTER)
+S_TH_R   = _s("thr",  fontSize=8.25, textColor=TEXT_MED2,  fontName="Helvetica-Bold", leading=10, alignment=TA_RIGHT)
+S_TD_L   = _s("tdl",  fontSize=8.25, textColor=TEXT_DARK,  leading=10)
+S_TD_LB  = _s("tdlb", fontSize=8.25, textColor=TEXT_DARK,  fontName="Helvetica-Bold", leading=10)
+S_TD_R   = _s("tdr",  fontSize=8.25, textColor=TEXT_DARK,  leading=10, alignment=TA_RIGHT)
+S_TD_RB  = _s("tdrb", fontSize=8.25, textColor=TEXT_DARK,  fontName="Helvetica-Bold", leading=10, alignment=TA_RIGHT)
+S_TD_C   = _s("tdc",  fontSize=8.25, textColor=TEXT_MED,   leading=10, alignment=TA_CENTER)
+S_TD_MUT = _s("tdm",  fontSize=8.25, textColor=TEXT_MUTED, leading=10, alignment=TA_RIGHT)
+S_TOT_L  = _s("totl", fontSize=8.25, textColor=TEXT_DARK,  fontName="Helvetica-Bold", leading=10)
+S_TOT_R  = _s("totr", fontSize=8.25, textColor=TEXT_DARK,  fontName="Helvetica-Bold", leading=10, alignment=TA_RIGHT)
+S_DECL   = _s("dcl",  fontSize=8.25, textColor=TEXT_MED,   leading=13)
+S_FNOTE  = _s("fno",  fontSize=7.5,  textColor=LABEL_C,    leading=9)
+S_SIGNER = _s("sgn",  fontSize=9.5,  textColor=TEXT_DARK,  fontName="Helvetica-Bold", leading=12)
+S_SIGROL = _s("sgr",  fontSize=7.8,  textColor=TEXT_MUTED, leading=10)
+S_VCODE  = _s("vcd",  fontSize=7.5,  textColor=TEXT_MUTED2, leading=9)
+S_PLACE  = _s("plc",  fontSize=7.5,  textColor=LABEL_C,    leading=10, alignment=TA_RIGHT)
 
 
-# ── Two-pass canvas (Page X / Y) ─────────────────────────────────────────────
+# ── Numbered canvas ───────────────────────────────────────────────────────────
 class _NumberedCanvas(pdfcanvas.Canvas):
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
@@ -96,70 +101,62 @@ class _NumberedCanvas(pdfcanvas.Canvas):
             self.__dict__.update(s)
             self.setFont("Helvetica", 7)
             self.setFillColor(LABEL_C)
-            self.drawRightString(PAGE_W - MR, FOOTER_H - 2*mm, f"Page {i} / {n}")
+            self.drawRightString(PAGE_W - MR, FOOT_H * 0.35, f"Page {i} / {n}")
             pdfcanvas.Canvas.showPage(self)
         pdfcanvas.Canvas.save(self)
 
 
-# ── Canvas: header + footer (drawn on every page) ─────────────────────────────
-def _draw_page(canvas, doc, logo_path):
+# ── Page decoration (header + footer, every page) ─────────────────────────────
+def _draw_page(canvas, doc, logo_path, vs_cert_no, mill_cert_no):
     canvas.saveState()
+    top = PAGE_H - 3 * mm
 
-    top = PAGE_H - 4 * mm
-
-    # Logo (top-left)
+    # Logo
     if logo_path and os.path.exists(logo_path):
         try:
-            canvas.drawImage(logo_path, ML, top - 9*mm,
-                             width=24*mm, height=9*mm,
+            canvas.drawImage(logo_path, ML, top - 9 * mm,
+                             width=24 * mm, height=9 * mm,
                              preserveAspectRatio=True, mask="auto")
         except Exception:
             pass
 
-    # Company address (below logo)
-    canvas.setFont("Helvetica", 7.5)
-    canvas.setFillColor(TEXT_MUTED)
-    canvas.drawString(ML, top - 14*mm,
-                      "Schönhauser Allee 36 · 10435 Berlin · Germany  "
-                      "·  USt-IdNr DE332534899  ·  support@vanillasteel.com")
-
-    # Certificate title (right-aligned)
+    # Title (right side)
     canvas.setFont("Helvetica-Bold", 13)
     canvas.setFillColor(TEXT_DARK)
-    canvas.drawRightString(PAGE_W - MR, top - 6*mm, "Inspection Certificate 3.1")
+    canvas.drawRightString(PAGE_W - MR, top - 5 * mm, "Inspection Certificate 3.1")
 
     canvas.setFont("Helvetica", 7.5)
-    canvas.setFillColor(LABEL_C)
-    canvas.drawRightString(PAGE_W - MR, top - 12*mm, "According to EN 10204:2004")
+    canvas.setFillColor(TEXT_MUTED2)
+    canvas.drawRightString(PAGE_W - MR, top - 11 * mm,
+                           f"EN 10204:2004  ·  Certificate {vs_cert_no}")
 
-    # 2pt navy rule below masthead
+    # Masthead rule
     canvas.setStrokeColor(NAVY)
     canvas.setLineWidth(1.5)
-    canvas.line(ML, PAGE_H - HEADER_H, PAGE_W - MR, PAGE_H - HEADER_H)
+    canvas.line(ML, PAGE_H - MAST_H, PAGE_W - MR, PAGE_H - MAST_H)
 
-    # Footer divider
+    # Footer rule
     canvas.setStrokeColor(BORDER_MED)
     canvas.setLineWidth(0.4)
-    canvas.line(ML, FOOTER_H, PAGE_W - MR, FOOTER_H)
+    canvas.line(ML, FOOT_H, PAGE_W - MR, FOOT_H)
 
-    # Footer text (left)
+    # Footer text
     canvas.setFont("Helvetica", 6.5)
     canvas.setFillColor(LABEL_C)
-    canvas.drawString(ML, FOOTER_H - 2.5*mm,
-                      "Vanilla Steel GmbH  ·  HRB 218619 B  ·  "
-                      "Managing Directors: Clifford Ondara, Simon Zühlke  ·  "
-                      "Electronically generated · valid without signature")
+    canvas.drawString(ML, FOOT_H * 0.35,
+                      f"Certificate {vs_cert_no}  ·  Mill cert {mill_cert_no}")
+    canvas.drawCentredString(PAGE_W / 2, FOOT_H * 0.35,
+                             "VANILLA STEEL  ·  Schönhauser Allee 36, 10435 Berlin, Germany  ·  USt-IdNr DE332534899")
 
     canvas.restoreState()
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-def _fmt(v):
+def _fmt(v, dec=4):
     if v is None or (isinstance(v, str) and not v.strip()):
         return "–"
     try:
-        f = float(v)
-        return f"{f:.4f}".rstrip("0").rstrip(".")
+        return f"{float(v):.{dec}f}".rstrip("0").rstrip(".")
     except (ValueError, TypeError):
         return str(v)
 
@@ -175,42 +172,58 @@ def _fmt_date(d):
     if not d:
         return "–"
     try:
-        from datetime import datetime
         dt = datetime.strptime(str(d).strip(), "%Y-%m-%d")
-        # day without leading zero, cross-platform
-        day = str(dt.day)
-        return f"{day} {dt.strftime('%b %Y')}"
+        return f"{dt.day} {dt.strftime('%b %Y')}"
     except Exception:
         return str(d)
 
+def _blank(v, fb="–"):
+    if v is None or (isinstance(v, str) and not v.strip()):
+        return fb
+    return str(v)
+
 def _get_chem(chems, elem):
-    for key in (elem, elem.lower(), elem.upper(), elem.capitalize()):
-        val = chems.get(key)
+    for k in (elem, elem.lower(), elem.upper(), elem.capitalize()):
+        val = chems.get(k)
         if val is not None:
             return _fmt(val)
     return "–"
 
+def _p(text, sty=None):
+    return Paragraph(str(text) if text is not None else "–", sty or S_TD_L)
+
 def _lbl(text):
     return Paragraph(text.upper(), S_LABEL)
 
-def _val(text):
-    return Paragraph(str(text) if text else "–", S_VAL)
 
-def _p(text, sty=None):
-    return Paragraph(str(text) if text is not None else "–", sty or S_BODY)
+# ── Section header ────────────────────────────────────────────────────────────
+def _sec_hdr(left_txt, right_txt="", width=None):
+    w = width or CONTENT_W
+    t = Table([[_p(left_txt, S_SEC), _p(right_txt, S_SEC_R)]],
+              colWidths=[w * 0.65, w * 0.35])
+    t.setStyle(TableStyle([
+        ("LINEBELOW",     (0,0), (-1,-1), 1.5, NAVY),
+        ("TOPPADDING",    (0,0), (-1,-1), 0),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 5),
+        ("LEFTPADDING",   (0,0), (-1,-1), 0),
+        ("RIGHTPADDING",  (0,0), (-1,-1), 0),
+    ]))
+    return t
 
 
-# ── Section builders ──────────────────────────────────────────────────────────
-
-def _meta_strip(cert_no, cert_date, standard):
-    cw = CONTENT_W / 4
+# ── 1. Meta strip (5-col) ─────────────────────────────────────────────────────
+def _meta_strip(vs_cert_no, mill_cert_no, issue_date, mat_standard, insp_type):
+    cw = CONTENT_W / 5
     data = [
-        [_lbl("Certificate No."), _lbl("Issue date"),
-         _lbl("Material standard"), _lbl("Place of issue")],
-        [_val(cert_no or "–"), _val(_fmt_date(cert_date)),
-         _val(standard or "–"), _val("Berlin, DE")],
+        [_lbl("Certificate No."), _lbl("Mill certificate No."), _lbl("Issue date"),
+         _lbl("Material standard"), _lbl("Inspection type")],
+        [_p(_blank(vs_cert_no),   S_META_V),
+         _p(_blank(mill_cert_no), S_META_V),
+         _p(_blank(issue_date),   S_META_V),
+         _p(_blank(mat_standard), S_META_V),
+         _p(_blank(insp_type),    S_META_V)],
     ]
-    t = Table(data, colWidths=[cw] * 4)
+    t = Table(data, colWidths=[cw] * 5)
     t.setStyle(TableStyle([
         ("TOPPADDING",    (0,0), (-1,-1), 0),
         ("BOTTOMPADDING", (0,0), (-1,-1), 2),
@@ -221,107 +234,21 @@ def _meta_strip(cert_no, cert_date, standard):
     return t
 
 
-def _order_refs_cell(so, vs_ref, customer_po, delivery_note):
-    pairs = [
-        ("Sales order",   so or "–"),
-        ("VS reference",  vs_ref or "–"),
-        ("Customer PO",   customer_po or "–"),
-        ("Delivery note", delivery_note or "–"),
-    ]
-    rows = [[_p(k, S_BODY), _p(v, S_BODYB)] for k, v in pairs]
-    t = Table(rows, colWidths=[30*mm, 30*mm])
-    t.setStyle(TableStyle([
-        ("TOPPADDING",    (0,0), (-1,-1), 1.5),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 1.5),
-        ("LEFTPADDING",   (0,0), (-1,-1), 0),
-        ("RIGHTPADDING",  (0,0), (-1,-1), 0),
-        ("ALIGN",         (1,0), (1,-1), "RIGHT"),
-    ]))
-    return t
+# ── 2. Parties (3-col) ────────────────────────────────────────────────────────
+def _parties(mfr_name, mfr_addr, csg_name, csg_addr, dst_name, dst_addr):
+    cw = CONTENT_W / 3
 
+    def col(label, name, addr):
+        items = [_lbl(label), Spacer(1, 1.5*mm), _p(_blank(name), S_PTY_N)]
+        if addr and str(addr).strip():
+            items.append(_p(str(addr), S_PTY_A))
+        return items
 
-def _product_single(coil, grade, quality):
-    """Product detail grid for a single-coil cert."""
-    grade_str = (f"{grade} — {quality}" if quality else grade) or "–"
-    thickness = str(coil.get("thickness_mm") or "–")
-    width     = str(coil.get("width_mm")     or "–")
-    dims = (f"{thickness} × {width} mm"
-            if thickness != "–" and width != "–" else "–")
-    weight = (_fmtw(coil.get("weight_kg")) + " kg"
-              if coil.get("weight_kg") else "–")
-    cast = coil.get("cast_no") or coil.get("coil_no") or "–"
-    qty  = str(coil.get("qty") or 1)
-
-    pairs = [
-        ("Heat / Cast No.", cast), ("Dimensions", dims),
-        ("Net weight", weight),    ("Pieces", qty),
-    ]
-    rows = [[_p(k, S_MUTED), _p(v, S_BODYB)] for k, v in pairs]
-    t = Table(rows, colWidths=[28*mm, 28*mm])
-    t.setStyle(TableStyle([
-        ("TOPPADDING",    (0,0), (-1,-1), 2),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 2),
-        ("LEFTPADDING",   (0,0), (-1,-1), 0),
-        ("RIGHTPADDING",  (0,0), (-1,-1), 0),
-        ("ALIGN",         (1,0), (1,-1), "RIGHT"),
-    ]))
-    return [
-        _p(grade_str, S_GRADE),
-        Spacer(1, 3*mm),
-        t,
-    ]
-
-
-def _product_multi(coils, grade, quality, parsed_cert):
-    """Product summary cell for multi-coil cert (detail goes in delivery table)."""
-    grade_str = (f"{grade} — {quality}" if quality else grade) or "–"
-    total_wt = parsed_cert.get("total_weight_kg") or sum(
-        float(c.get("weight_kg") or 0) for c in coils) or None
-    wt_s = _fmtw(total_wt) + " kg" if total_wt else "–"
-    return [
-        _p(grade_str, S_GRADE),
-        Spacer(1, 3*mm),
-        _p(f"{len(coils)} coils  ·  {wt_s} total", S_BODY),
-    ]
-
-
-def _middle_section(odoo_data, coils, grade, quality, parsed_cert):
-    """3-column table: Consignee | Order references | Product."""
-    buyer      = odoo_data.get("buyer_name",    "") or "–"
-    buyer_addr = odoo_data.get("buyer_address", "") or ""
-    so         = odoo_data.get("so_number",     "") or "–"
-    vs_ref     = odoo_data.get("vs_reference",  "") or ""
-    cust_po    = (odoo_data.get("customer_po",  "")
-                  or parsed_cert.get("po_number", "") or "")
-    del_note   = odoo_data.get("delivery_note", "") or ""
-
-    single = (len(coils) == 1)
-    coil0  = coils[0] if coils else {}
-
-    # Column contents (lists of flowables)
-    col1 = [
-        _lbl("Consignee"),
-        Spacer(1, 1.5*mm),
-        _p(buyer, S_BODYB),
-    ]
-    if buyer_addr:
-        col1.append(_p(buyer_addr, S_BODY))
-
-    col2 = [
-        _lbl("Order references"),
-        Spacer(1, 1.5*mm),
-        _order_refs_cell(so, vs_ref, cust_po, del_note),
-    ]
-
-    col3 = [_lbl("Product"), Spacer(1, 1.5*mm)]
-    if single:
-        col3 += _product_single(coil0, grade, quality)
-    else:
-        col3 += _product_multi(coils, grade, quality, parsed_cert)
-
-    cw = [CONTENT_W * f for f in [0.30, 0.30, 0.40]]
-    data = [[col1, col2, col3]]
-    t = Table(data, colWidths=cw)
+    t = Table([[
+        col("Manufacturer / Mill", mfr_name, mfr_addr),
+        col("Consignee", csg_name, csg_addr),
+        col("Destination / Delivery point", dst_name, dst_addr),
+    ]], colWidths=[cw] * 3)
     t.setStyle(TableStyle([
         ("VALIGN",        (0,0), (-1,-1), "TOP"),
         ("TOPPADDING",    (0,0), (-1,-1), 0),
@@ -333,179 +260,246 @@ def _middle_section(odoo_data, coils, grade, quality, parsed_cert):
     return t
 
 
-def _delivery_table(coils):
-    """Shown only for multi-coil certs, between middle section and chemistry."""
-    has_coil = any(c.get("coil_no") for c in coils)
-    has_cast = any(c.get("cast_no") for c in coils)
+# ── 3. Refs + Spec (2-col KV) ─────────────────────────────────────────────────
+def _kv_list(pairs, col_w):
+    rows = [[_p(k, S_KV_K), _p(_blank(v), S_KV_V)] for k, v in pairs]
+    t = Table(rows, colWidths=[col_w * 0.54, col_w * 0.46])
+    style = [
+        ("TOPPADDING",    (0,0), (-1,-1), 3),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 3),
+        ("LEFTPADDING",   (0,0), (-1,-1), 0),
+        ("RIGHTPADDING",  (0,0), (-1,-1), 0),
+        ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
+    ]
+    for i in range(len(rows) - 1):
+        style.append(("LINEBELOW", (0,i), (-1,i), 0.4, BORDER_MED))
+    t.setStyle(TableStyle(style))
+    return t
 
-    if has_coil and has_cast:
-        headers = ["#", "Heat / Cast No.", "Coil No.", "Thickness mm", "Width mm", "Net Weight kg"]
-        weights = [0.05, 0.22, 0.22, 0.17, 0.17, 0.17]
-    elif has_cast:
-        headers = ["#", "Heat / Cast No.", "Thickness mm", "Width mm", "Net Weight kg"]
-        weights = [0.05, 0.30, 0.22, 0.22, 0.21]
-    else:
-        headers = ["#", "Pack / Coil No.", "Thickness mm", "Width mm", "Net Weight kg"]
-        weights = [0.05, 0.30, 0.22, 0.22, 0.21]
 
-    cw = [CONTENT_W * w for w in weights]
+def _refs_spec(refs, spec):
+    GAP = 9 * mm
+    cw = (CONTENT_W - GAP) / 2   # each column's usable width
 
-    head_row = [_p(h, S_THDR) for h in headers]
-    rows = [head_row]
-    for i, coil in enumerate(coils, 1):
-        wt = _fmtw(coil.get("weight_kg"))
-        if has_coil and has_cast:
-            row = [i, coil.get("cast_no") or "–", coil.get("coil_no") or "–",
-                   coil.get("thickness_mm") or "–", coil.get("width_mm") or "–", wt]
-        elif has_cast:
-            row = [i, coil.get("cast_no") or "–",
-                   coil.get("thickness_mm") or "–", coil.get("width_mm") or "–", wt]
-        else:
-            row = [i, coil.get("coil_no") or coil.get("pack_nr") or "–",
-                   coil.get("thickness_mm") or "–", coil.get("width_mm") or "–", wt]
-        rows.append([_p(str(c), S_TCENR if idx > 0 else S_TCENR)
-                     for idx, c in enumerate(row)])
+    left  = [_sec_hdr("Order references",     width=cw), Spacer(1, 2*mm), _kv_list(refs, cw)]
+    right = [_sec_hdr("Product specification", width=cw), Spacer(1, 2*mm), _kv_list(spec, cw)]
+
+    t = Table([[left, Spacer(GAP, 1), right]], colWidths=[cw, GAP, cw])
+    t.setStyle(TableStyle([
+        ("VALIGN",        (0,0), (-1,-1), "TOP"),
+        ("TOPPADDING",    (0,0), (-1,-1), 0),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 0),
+        ("LEFTPADDING",   (0,0), (-1,-1), 0),
+        ("RIGHTPADDING",  (0,0), (-1,-1), 0),
+    ]))
+    return t
+
+
+# ── 4. Items table ────────────────────────────────────────────────────────────
+def _items_table(coils, total_weight):
+    # Proportional column widths summing to CONTENT_W
+    fracs = [0.045, 0.17, 0.12, 0.10, 0.08, 0.08, 0.13, 0.13, 0.065]
+    cw = [CONTENT_W * f for f in fracs]
+
+    header = [
+        _p("Item",          S_TH),   _p("Coil / Pack No.", S_TH),
+        _p("Heat / Cast",   S_TH),   _p("Serial No.",      S_TH),
+        _p("Thickness",     S_TH_R), _p("Width",           S_TH_R),
+        _p("Net wt.",       S_TH_R), _p("Gross wt.",       S_TH_R),
+        _p("Pcs",           S_TH_R),
+    ]
+
+    rows = [header]
+    for i, c in enumerate(coils, 1):
+        rows.append([
+            _p(str(i),                                     S_TD_L),
+            _p(_blank(c.get("coil_no")),                   S_TD_LB),
+            _p(_blank(c.get("cast_no")),                   S_TD_L),
+            _p(_blank(c.get("serial") or c.get("serial_no", "")), S_TD_C),
+            _p(_blank(c.get("thickness_mm")),              S_TD_R),
+            _p(_blank(c.get("width_mm")),                  S_TD_R),
+            _p(_fmtw(c.get("weight_kg")),                  S_TD_R),
+            _p(_blank(c.get("gross_weight_kg", "")),        S_TD_MUT),
+            _p(str(c.get("qty") or 1),                     S_TD_R),
+        ])
+
+    # Total row — spans cols 0-5, then net total, gross blank, pcs count
+    total_row = [
+        _p(f"Total — {len(coils)} coils", S_TOT_L),
+        "", "", "", "", "",
+        _p(_fmtw(total_weight), S_TOT_R),
+        _p("", S_TD_L),
+        _p(str(len(coils)), S_TOT_R),
+    ]
+    rows.append(total_row)
+
+    t = Table(rows, colWidths=cw, repeatRows=1)
+    t.setStyle(TableStyle([
+        ("SPAN",          (0,-1), (5,-1)),
+        ("LINEBELOW",     (0,0),  (-1,0),  1.5, NAVY),
+        ("LINEABOVE",     (0,-1), (-1,-1), 1.5, NAVY),
+        ("LINEBELOW",     (0,1),  (-1,-2), 0.5, BORDER_LIGHT),
+        ("TOPPADDING",    (0,0),  (-1,-1), 6),
+        ("BOTTOMPADDING", (0,0),  (-1,-1), 6),
+        ("LEFTPADDING",   (0,0),  (-1,-1), 5),
+        ("RIGHTPADDING",  (0,0),  (-1,-1), 5),
+        ("FONTSIZE",      (0,0),  (-1,-1), 8.25),
+        ("TEXTCOLOR",     (0,0),  (-1,0),  TEXT_MED2),
+        ("TEXTCOLOR",     (0,1),  (0,-2),  TEXT_MUTED),
+        ("ALIGN",         (4,0),  (-1,-1), "RIGHT"),
+        ("ALIGN",         (3,1),  (3,-1),  "CENTER"),
+        ("FONTNAME",      (0,-1), (-1,-1), "Helvetica-Bold"),
+    ]))
+    return t
+
+
+# ── 5. Mechanical table (one row per coil) ────────────────────────────────────
+def _mech_table(coils):
+    has_mech = any(c.get("mechanical") for c in coils)
+    if not has_mech:
+        return None
+
+    fracs = [0.18, 0.055, 0.075, 0.13, 0.13, 0.07, 0.10, 0.10, 0.16]
+    cw = [CONTENT_W * f for f in fracs]
+
+    header = [
+        _p("Coil / Pack No.",     S_TH),
+        _p("Dir.",                S_TH_C),
+        _p("Cond.",               S_TH_C),
+        _p("Yield Re/Rp0.2",      S_TH_R),
+        _p("Tensile Rm",          S_TH_R),
+        _p("A",                   S_TH_R),
+        _p("Rp/Rm",               S_TH_R),
+        _p("Bend test",           S_TH_C),
+        _p("Coating top/btm",     S_TH_R),
+    ]
+
+    rows = [header]
+    for c in coils:
+        m = c.get("mechanical") or {}
+        rp02 = m.get("rp02")
+        rm   = m.get("rm")
+        a    = m.get("a_pct")
+        ratio = ""
+        if rp02 and rm:
+            try:
+                ratio = f"{float(rp02)/float(rm):.2f}"
+            except Exception:
+                pass
+        coil_id = _blank(c.get("coil_no") or c.get("cast_no"))
+        rows.append([
+            _p(coil_id,                              S_TD_LB),
+            _p(m.get("dir", "L"),                   S_TD_C),
+            _p(_blank(m.get("cond", "")),           S_TD_C),
+            _p(str(rp02) if rp02 else "–",          S_TD_RB),
+            _p(str(rm)   if rm   else "–",          S_TD_RB),
+            _p(_fmt(a, 1) if a is not None else "–", S_TD_R),
+            _p(ratio or "–",                        S_TD_MUT),
+            _p(_blank(m.get("bend", "")),           S_TD_C),
+            _p(_blank(c.get("coating", "") or c.get("coating_g_m2", "")), S_TD_MUT),
+        ])
 
     t = Table(rows, colWidths=cw, repeatRows=1)
     t.setStyle(TableStyle([
         ("LINEBELOW",     (0,0),  (-1,0),  1.5, NAVY),
         ("LINEBELOW",     (0,1),  (-1,-1), 0.5, BORDER_LIGHT),
-        ("TOPPADDING",    (0,0),  (-1,-1), 5),
-        ("BOTTOMPADDING", (0,0),  (-1,-1), 5),
-        ("LEFTPADDING",   (0,0),  (-1,-1), 3),
-        ("RIGHTPADDING",  (0,0),  (-1,-1), 3),
-        ("ALIGN",         (0,0),  (-1,-1), "CENTER"),
-        ("FONTNAME",      (0,1),  (-1,-1), "Helvetica"),
-        ("FONTSIZE",      (0,0),  (-1,-1), 8),
-        ("TEXTCOLOR",     (0,0),  (-1,-1), TEXT_DARK),
-    ]))
-    return t
-
-
-def _chem_table(coils):
-    ELEMS = ["C","Si","Mn","P","S","Al","Nb","Ti","V","Cu","Cr","Ni","Mo"]
-    present = [e for e in ELEMS
-               if any(_get_chem(c.get("chemicals") or {}, e) != "\u2013" for c in coils)]
-    if not present:
-        return None
-    cw_heat = 26 * mm
-    cw_elem = (CONTENT_W - cw_heat) / len(present)
-    head = [_p("Heat No.", S_THDR)] + [_p(e, S_THDR) for e in present]
-    rows = [head]
-    seen_heats = {}
-    for coil in coils:
-        heat = coil.get("cast_no") or coil.get("coil_no") or "\u2013"
-        if heat in seen_heats:
-            continue
-        seen_heats[heat] = True
-        chems = coil.get("chemicals") or {}
-        row = [_p(heat, S_TCENR)] + [_p(_get_chem(chems, e), S_TCENR) for e in present]
-        rows.append(row)
-    t = Table(rows, colWidths=[cw_heat] + [cw_elem] * len(present))
-    t.setStyle(TableStyle([
-        ("LINEBELOW",     (0,0),  (-1,0),  1.5, NAVY),
-        ("LINEBELOW",     (0,1),  (-1,-1), 0.5, BORDER_LIGHT),
         ("TOPPADDING",    (0,0),  (-1,-1), 6),
         ("BOTTOMPADDING", (0,0),  (-1,-1), 6),
-        ("LEFTPADDING",   (0,0),  (-1,-1), 3),
-        ("RIGHTPADDING",  (0,0),  (-1,-1), 3),
-        ("ALIGN",         (0,0),  (-1,-1), "CENTER"),
-        ("FONTNAME",      (0,0),  (-1,0),  "Helvetica-Bold"),
-        ("FONTNAME",      (0,1),  (-1,-1), "Helvetica"),
-        ("FONTNAME",      (0,1),  (0,-1),  "Helvetica-Bold"),
-        ("FONTSIZE",      (0,0),  (-1,-1), 8),
-        ("TEXTCOLOR",     (0,0),  (-1,0),  TEXT_MED),
-        ("TEXTCOLOR",     (0,1),  (-1,-1), TEXT_DARK),
+        ("LEFTPADDING",   (0,0),  (-1,-1), 5),
+        ("RIGHTPADDING",  (0,0),  (-1,-1), 5),
+        ("FONTSIZE",      (0,0),  (-1,-1), 8.25),
+        ("TEXTCOLOR",     (0,0),  (-1,0),  TEXT_MED2),
     ]))
     return t
 
 
-def _mech_table(coils):
-    has_mech = any(c.get("mechanical") for c in coils)
-    if not has_mech:
-        return None
-    cw = [CONTENT_W * 0.56 * f for f in [0.50, 0.18, 0.20, 0.12]]
-    head = [_p(h, S_THDR) for h in ["Property", "Result", "Specified", "Unit"]]
-    rows = [head]
+# ── 6. Chemical table (one row per unique heat) ───────────────────────────────
+def _chem_table(coils):
     seen = {}
-    for coil in coils:
-        m = coil.get("mechanical") or {}
-        if not m:
-            continue
-        key = (coil.get("cast_no") or "", m.get("rp02"), m.get("rm"), m.get("a_pct"))
-        if key in seen:
-            continue
-        seen[key] = True
-        rp02 = m.get("rp02")
-        rm   = m.get("rm")
-        a    = m.get("a_pct")
-        a_s  = (f"{float(a):.1f}" if isinstance(a, (int, float)) else str(a)) if a else "\u2013"
-        rows += [
-            [_p("Yield strength Rp0.2", S_TLEFT), _p(str(rp02) if rp02 else "\u2013", S_TRIGHT),
-             _p("", S_TRIGHTM), _p("N/mm\u00b2", S_TRIGHTM)],
-            [_p("Tensile strength Rm",  S_TLEFT), _p(str(rm)   if rm   else "\u2013", S_TRIGHT),
-             _p("", S_TRIGHTM), _p("N/mm\u00b2", S_TRIGHTM)],
-            [_p("Elongation A80",       S_TLEFT), _p(a_s, S_TRIGHT),
-             _p("", S_TRIGHTM), _p("%", S_TRIGHTM)],
-        ]
-    t = Table(rows, colWidths=cw)
+    for c in coils:
+        heat = c.get("cast_no") or c.get("coil_no") or ""
+        if heat and heat not in seen:
+            seen[heat] = c.get("chemicals") or {}
+    if not seen:
+        return None
+
+    present = [e for e in CHEM_ELEMS
+               if any(_get_chem(ch, e) != "–" for ch in seen.values())]
+    if not present:
+        return None
+
+    cw_heat = CONTENT_W * 0.12
+    cw_elem = (CONTENT_W - cw_heat) / len(present)
+
+    header = [_p("Heat / Cast", S_TH)] + [_p(e, S_TH_R) for e in present]
+    rows = [header]
+    for heat, chems in seen.items():
+        rows.append([_p(heat, S_TD_LB)] + [_p(_get_chem(chems, e), S_TD_R) for e in present])
+
+    t = Table(rows, colWidths=[cw_heat] + [cw_elem] * len(present), repeatRows=1)
     t.setStyle(TableStyle([
         ("LINEBELOW",     (0,0),  (-1,0),  1.5, NAVY),
         ("LINEBELOW",     (0,1),  (-1,-1), 0.5, BORDER_LIGHT),
-        ("TOPPADDING",    (0,0),  (-1,-1), 7),
-        ("BOTTOMPADDING", (0,0),  (-1,-1), 7),
-        ("LEFTPADDING",   (0,0),  (-1,-1), 3),
-        ("RIGHTPADDING",  (0,0),  (-1,-1), 3),
-        ("FONTNAME",      (0,0),  (-1,0),  "Helvetica-Bold"),
-        ("FONTNAME",      (0,1),  (-1,-1), "Helvetica"),
-        ("FONTNAME",      (1,1),  (1,-1),  "Helvetica-Bold"),
-        ("FONTSIZE",      (0,0),  (-1,-1), 8),
-        ("TEXTCOLOR",     (0,0),  (-1,0),  TEXT_MED),
-        ("TEXTCOLOR",     (2,1),  (3,-1),  TEXT_MUTED),
+        ("TOPPADDING",    (0,0),  (-1,-1), 5),
+        ("BOTTOMPADDING", (0,0),  (-1,-1), 5),
+        ("LEFTPADDING",   (0,0),  (-1,-1), 4),
+        ("RIGHTPADDING",  (0,0),  (-1,-1), 4),
+        ("FONTSIZE",      (0,0),  (-1,-1), 8.25),
+        ("TEXTCOLOR",     (0,0),  (-1,0),  TEXT_MED2),
     ]))
     return t
 
 
-def _bottom_section(mech_t):
-    decl = (
-        "We hereby certify that the material described above has been tested "
-        "and inspected in accordance with the order and the applicable standard, "
+# ── 7. Declaration block ──────────────────────────────────────────────────────
+def _declaration(parsed_cert, mill_cert_no, vs_cert_no, issue_date):
+    DECL_TEXT = (
+        "We hereby certify that the material described above has been manufactured, "
+        "tested and inspected in accordance with the order and the applicable standard, "
         "and that the results comply with the specification."
     )
-    left_cell  = [mech_t] if mech_t else [_p("No mechanical data.", S_MUTED)]
-    right_cell = [
-        _p(decl, S_DECL),
-        Spacer(1, 6*mm),
-        _p("Vanilla Steel GmbH", S_SIGNAM),
-        _p("Quality Assurance", S_SIGROL),
-        Spacer(1, 4*mm),
-        _p("Electronically generated \u00b7 valid without signature", S_NOTE),
+    remarks  = _blank(parsed_cert.get("remarks", ""), "")
+    mfr_name = _blank(parsed_cert.get("manufacturer_name", ""), "")
+    footnote = f"Composition and results transcribed from mill certificate {mill_cert_no}"
+    if mfr_name:
+        footnote += f" ({mfr_name})"
+    footnote += "."
+
+    h = hashlib.md5(vs_cert_no.encode()).hexdigest().upper()
+    verify_code = f"VS-{h[:4]}-{h[4:8]}"
+
+    left_items = [_p(DECL_TEXT, S_DECL)]
+    if remarks:
+        left_items += [Spacer(1, 2*mm),
+                       _p(f"<font color='#6b7280'>Remarks: </font>{remarks}", S_DECL)]
+    left_items += [Spacer(1, 2*mm), _p(footnote, S_FNOTE)]
+
+    right_items = [
+        _p("Vanilla Steel GmbH", S_SIGNER),
+        _p("Quality Assurance",  S_SIGROL),
+        Spacer(1, 3*mm),
+        _p("Verification code",  S_VCODE),
+        _p(verify_code,          S_KV_V),
+        Spacer(1, 3*mm),
+        _p(f"Berlin, DE  ·  {issue_date}  ·  Valid without signature", S_PLACE),
     ]
-    cw = [CONTENT_W * 0.56, CONTENT_W * 0.44]
-    t = Table([[left_cell, right_cell]], colWidths=cw)
+
+    GAP = 10 * mm
+    lw = (CONTENT_W - GAP) * (1.6 / 2.6)
+    rw = (CONTENT_W - GAP) * (1.0 / 2.6)
+
+    t = Table([[left_items, right_items]], colWidths=[lw + GAP, rw])
     t.setStyle(TableStyle([
         ("VALIGN",        (0,0), (-1,-1), "BOTTOM"),
         ("TOPPADDING",    (0,0), (-1,-1), 0),
         ("BOTTOMPADDING", (0,0), (-1,-1), 0),
         ("LEFTPADDING",   (0,0), (-1,-1), 0),
-        ("RIGHTPADDING",  (0,0), (-1,-1), 0),
-        ("LEFTPADDING",   (1,0), (1,0),   10),
+        ("RIGHTPADDING",  (0,0), (0,0),   GAP),
+        ("RIGHTPADDING",  (1,0), (1,0),   0),
     ]))
     return t
 
 
-def _sec_hdr(left, right=""):
-    data = [[_p(f"<b>{left}</b>", S_TLEFTB), _p(right, S_SECR)]]
-    t = Table(data, colWidths=[CONTENT_W * 0.6, CONTENT_W * 0.4])
-    t.setStyle(TableStyle([
-        ("TOPPADDING",    (0,0), (-1,-1), 0),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 3),
-        ("LEFTPADDING",   (0,0), (-1,-1), 0),
-        ("RIGHTPADDING",  (0,0), (-1,-1), 0),
-    ]))
-    return t
-
-
+# ── Main entry point ──────────────────────────────────────────────────────────
 def generate_certificate(
     parsed_cert: dict,
     odoo_data:   dict,
@@ -513,44 +507,103 @@ def generate_certificate(
 ) -> bytes:
     buf   = BytesIO()
     coils = parsed_cert.get("coils") or []
-    multi = len(coils) > 1
-    grade    = parsed_cert.get("grade",       "") or ""
-    quality  = parsed_cert.get("quality",     "") or ""
-    cert_no  = parsed_cert.get("cert_number", "") or "\u2013"
-    cert_date= parsed_cert.get("cert_date",   "") or ""
-    standard = parsed_cert.get("standard",    "") or ""
 
+    # ── Data assembly ──────────────────────────────────────────────────────────
+    mill_cert_no = _blank(parsed_cert.get("cert_number"), "–")
+    vs_cert_no   = f"VS-{mill_cert_no}"
+    cert_date    = parsed_cert.get("cert_date") or ""
+    issue_date   = _fmt_date(cert_date)
+    mat_standard = _blank(parsed_cert.get("standard"), "–")
+    insp_type    = _blank(parsed_cert.get("insp_type"), "3.1 / EN 10204")
+
+    grade   = parsed_cert.get("grade")   or ""
+    quality = parsed_cert.get("quality") or ""
+    grade_quality = " — ".join(x for x in [grade, quality] if x) or "–"
+
+    mfr_name = parsed_cert.get("manufacturer_name")    or ""
+    mfr_addr = parsed_cert.get("manufacturer_address") or ""
+
+    csg_name = odoo_data.get("buyer_name",    "") or ""
+    csg_addr = odoo_data.get("buyer_address", "") or ""
+    dst_name = odoo_data.get("dest_name",     "") or ""
+    dst_addr = odoo_data.get("dest_address",  "") or ""
+
+    # Order references
+    refs = [
+        ("VS reference",            odoo_data.get("so_number") or odoo_data.get("vs_reference") or ""),
+        ("Customer order No.",      parsed_cert.get("po_number") or odoo_data.get("customer_po") or ""),
+        ("Mill order No.",          parsed_cert.get("mill_order_no") or ""),
+        ("Agency order No.",        ""),
+        ("Contract No.",            ""),
+        ("Dispatch note",           parsed_cert.get("dispatch_note") or odoo_data.get("delivery_note") or ""),
+        ("Transport / freight car", ""),
+        ("Marking",                 ""),
+    ]
+
+    # Product specification
+    spec = [
+        ("Product description",   parsed_cert.get("material_type") or ""),
+        ("Grade / quality",       grade_quality),
+        ("Coating",               parsed_cert.get("coating") or ""),
+        ("Surface group / class", parsed_cert.get("surface_quality") or ""),
+        ("Delivery condition",    parsed_cert.get("delivery_condition") or ""),
+        ("Dimensional tolerance", parsed_cert.get("dimensional_tolerance") or ""),
+        ("Country of origin",     parsed_cert.get("country_of_origin") or ""),
+        ("Steelmaking process",   parsed_cert.get("steelmaking_process") or ""),
+    ]
+
+    total_weight = parsed_cert.get("total_weight_kg") or (
+        sum(float(c.get("weight_kg") or 0) for c in coils) or None)
+
+    # ── Story ──────────────────────────────────────────────────────────────────
     story = []
-    story.append(_meta_strip(cert_no, cert_date, standard))
+
+    # Page 1 fixed sections — kept together
+    story.append(KeepTogether([
+        _meta_strip(vs_cert_no, mill_cert_no, issue_date, mat_standard, insp_type),
+        Spacer(1, 5*mm),
+        _parties(mfr_name, mfr_addr, csg_name, csg_addr, dst_name, dst_addr),
+        Spacer(1, 5*mm),
+        _refs_spec(refs, spec),
+    ]))
     story.append(Spacer(1, 5*mm))
-    story.append(_middle_section(odoo_data, coils, grade, quality, parsed_cert))
+
+    # Items
+    story.append(_sec_hdr("Delivery items & dimensions", "Dimensions in mm · weights in kg"))
+    story.append(_items_table(coils, total_weight))
     story.append(Spacer(1, 5*mm))
-    if multi:
-        story.append(_sec_hdr("Delivery details"))
-        story.append(_delivery_table(coils))
-        story.append(Spacer(1, 5*mm))
-    chem_t = _chem_table(coils)
-    if chem_t:
-        story.append(_sec_hdr("Chemical composition", "Heat analysis \u00b7 % by mass"))
-        story.append(chem_t)
-        story.append(Spacer(1, 5*mm))
+
+    # Mechanical
     mech_t = _mech_table(coils)
     if mech_t:
-        story.append(_sec_hdr("Mechanical properties"))
-    story.append(_bottom_section(mech_t))
+        story.append(_sec_hdr("Mechanical properties",
+                              "Yield / Tensile in N/mm²  ·  Elongation in %"))
+        story.append(mech_t)
+        story.append(Spacer(1, 5*mm))
 
+    # Chemical
+    chem_t = _chem_table(coils)
+    if chem_t:
+        story.append(_sec_hdr("Chemical composition", "Heat analysis · % by mass"))
+        story.append(chem_t)
+        story.append(Spacer(1, 5*mm))
+
+    # Declaration
+    story.append(_declaration(parsed_cert, mill_cert_no, vs_cert_no, issue_date))
+
+    # ── Document ───────────────────────────────────────────────────────────────
     doc = BaseDocTemplate(
         buf,
         pagesize=(PAGE_W, PAGE_H),
         leftMargin=ML, rightMargin=MR,
-        topMargin=HEADER_H + 2*mm,
-        bottomMargin=FOOTER_H + 3*mm,
+        topMargin=MAST_H + 2*mm,
+        bottomMargin=FOOT_H + 2*mm,
     )
     frame = Frame(ML, FRAME_Y, CONTENT_W, FRAME_H,
                   leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0)
     doc.addPageTemplates([PageTemplate(
         id="main", frames=[frame],
-        onPage=lambda c, d: _draw_page(c, d, logo_path),
+        onPage=lambda c, d: _draw_page(c, d, logo_path, vs_cert_no, mill_cert_no),
     )])
     doc.build(story, canvasmaker=_NumberedCanvas)
     return buf.getvalue()
