@@ -8,9 +8,13 @@ Lessons applied from previous Docsumo/GitHub pipeline:
 - /match-cert is separate from /generate-cert so Make can show match info before generating
 - Validation rejects obviously bad extractions early (no coils = don't attempt PDF)
 - match_type in response tells Make whether PO was explicit, auto-matched, or unmatched
+
+Body format flexibility:
+- Wrapped:  {"parsed_cert": {...}, "po_number": "..."}   ← original format
+- Raw:      {...cert fields directly...}                  ← Make can send Claude text directly
 """
 import os
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response, JSONResponse
 from pydantic import BaseModel
 
@@ -31,6 +35,20 @@ def startup():
 class CertRequest(BaseModel):
     parsed_cert: dict
     po_number:   str | None = None
+
+
+async def _parse_body(request: Request) -> tuple[dict, str]:
+    """
+    Accept two body formats:
+      1. {"parsed_cert": {...}, "po_number": "..."}  — wrapped (original)
+      2. {...cert fields...}                          — raw cert JSON (Make direct)
+    Returns (parsed_cert_dict, po_number_str).
+    """
+    body = await request.json()
+    if "parsed_cert" in body:
+        return body["parsed_cert"], body.get("po_number") or ""
+    else:
+        return body, body.get("po_number") or ""
 
 
 def _odoo_lookup(parsed: dict, po_num: str) -> tuple[dict, str, int]:
@@ -72,13 +90,13 @@ def _odoo_lookup(parsed: dict, po_num: str) -> tuple[dict, str, int]:
 
 
 @app.post("/match-cert")
-def match_cert(req: CertRequest):
+async def match_cert(request: Request):
     """
     Odoo lookup only — returns JSON with match details.
     Make calls this first to show match info in Slack notification.
+    Accepts both wrapped {"parsed_cert":{...}} and raw cert JSON bodies.
     """
-    parsed = req.parsed_cert
-    po_num = req.po_number or parsed.get("po_number") or ""
+    parsed, po_num = await _parse_body(request)
 
     odoo_data, match_type, score = _odoo_lookup(parsed, po_num)
 
@@ -99,13 +117,14 @@ def match_cert(req: CertRequest):
 
 
 @app.post("/generate-cert")
-def generate(req: CertRequest):
+async def generate(request: Request):
     """
     Generate the neutralised PDF.
     Make calls this after /match-cert (and optional Slack approval).
     Returns PDF bytes as application/pdf.
+    Accepts both wrapped {"parsed_cert":{...}} and raw cert JSON bodies.
     """
-    parsed = req.parsed_cert
+    parsed, po_num = await _parse_body(request)
 
     # ── Validate extraction ───────────────────────────────────────────────────
     # Lesson: don't attempt PDF generation on empty/garbage Claude output.
@@ -120,8 +139,6 @@ def generate(req: CertRequest):
             status_code=422,
             detail="Extraction returned no grade or material type. Cert may need manual processing."
         )
-
-    po_num = req.po_number or parsed.get("po_number") or ""
     odoo_data, match_type, score = _odoo_lookup(parsed, po_num)
 
     try:
