@@ -405,23 +405,19 @@ def get_neutralisation_data(vs_po_number: str) -> dict:
     }
 
 
+
+
 def find_po_for_cert(cert_signals: dict) -> tuple:
     """
     When no PO number appears on a supplier cert, search all confirmed PO lines
-    from the last 60 days and score them against the cert's signals.
+    from the last 60 days and score each PO (not individual lines) against the
+    cert signals.
 
-    cert_signals keys:
-        weight_kg    — total cert weight in kg (float)
-        grade        — grade string from cert/Docsumo
-        material_type— material description
-        quality      — quality/choice string
-        width_mm     — width as string
-        thickness_mm — thickness as string
+    Key fix: cert total weight is compared against the PO TOTAL weight
+    (sum of all lines), not individual line weights. A cert typically covers
+    one full PO, so cert total ~ PO total.
 
-    Returns:
-        (best_po_number, best_score, candidates)
-        candidates: list of (po_number, score, vsi_article) sorted by score desc
-                    only candidates scoring >= 4 are included
+    Returns (best_po_number, best_score, candidates)
     """
     since = (datetime.utcnow() - timedelta(days=60)).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -430,7 +426,7 @@ def find_po_for_cert(cert_signals: dict) -> tuple:
         [[["state", "in", ["purchase", "done"]], ["date_order", ">=", since]]]
     )
     if not po_ids:
-        print("[Odoo] No confirmed POs in last 60 days — cannot auto-match.")
+        print("[Odoo] No confirmed POs in last 60 days -- cannot auto-match.")
         return None, 0, []
 
     lines = _call(
@@ -443,29 +439,39 @@ def find_po_for_cert(cert_signals: dict) -> tuple:
             "width", "thickness",
         ]}
     )
-    print(f"[Odoo] Auto-match: scoring {len(lines)} PO line(s) against cert signals...")
+    print("[Odoo] Auto-match: %d PO line(s) across %d POs" % (len(lines), len(po_ids)))
 
-    raw_candidates = []
+    # Group lines by PO, sum weights, keep first line's specs as representative
+    po_agg = {}
     for line in lines:
-        line["weight_t"]     = line.get("product_uom_qty")
-        line["width_mm"]     = str(line.get("width")     or "").strip()
-        line["thickness_mm"] = str(line.get("thickness") or "").strip()
-        s = _score_line(line, cert_signals)
+        if isinstance(line.get("order_id"), list):
+            po_ref = line["order_id"][1]
+        else:
+            po_ref = str(line.get("order_id", ""))
+
+        if po_ref not in po_agg:
+            po_agg[po_ref] = {
+                "weight_t":    0.0,
+                "grade":       line.get("grade") or "",
+                "choice":      line.get("choice") or "",
+                "form":        line.get("form") or "",
+                "finish":      line.get("finish") or "",
+                "coating":     line.get("coating") or "",
+                "width_mm":    str(line.get("width") or "").strip(),
+                "thickness_mm": str(line.get("thickness") or "").strip(),
+                "first_vsi":   line.get("vs_article") or "-",
+            }
+        po_agg[po_ref]["weight_t"] += float(line.get("product_uom_qty") or 0)
+
+    # Score each PO against the cert signals
+    candidates = []
+    for po_ref, agg in po_agg.items():
+        s = _score_line(agg, cert_signals)
         if s >= 4:
-            po_ref = (line["order_id"][1]
-                      if isinstance(line.get("order_id"), list)
-                      else str(line.get("order_id", "")))
-            raw_candidates.append((po_ref, s, line.get("vs_article", "–")))
+            candidates.append((po_ref, s, agg["first_vsi"]))
 
-    best_per_po: dict[str, tuple] = {}
-    for po_ref, score, vsi in sorted(raw_candidates, key=lambda x: x[1], reverse=True):
-        if po_ref not in best_per_po or best_per_po[po_ref][0] < score:
-            best_per_po[po_ref] = (score, vsi)
-
-    candidates = sorted(
-        [(po, sc, vsi) for po, (sc, vsi) in best_per_po.items()],
-        key=lambda x: x[1], reverse=True,
-    )
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    print("[Odoo] Top candidates: %s" % str(candidates[:3]))
 
     if not candidates:
         return None, 0, []
