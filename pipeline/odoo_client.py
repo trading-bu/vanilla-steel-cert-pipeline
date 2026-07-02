@@ -288,11 +288,14 @@ def get_neutralisation_data(vs_po_number: str) -> dict:
         prod      = product_detail.get(prod_id, {})
         prod_name = prod.get("name", "") or (l.get("product_id") or [None, ""])[1] or ""
 
+        qty = l.get("product_uom_qty") or 0
         vs_articles.append({
             "vs_article":                l.get("vs_article") or "–",
             "aoo_fast_number":           l.get("aoo_fast_number"),
             "original_supplier_article": l.get("original_supplier_article"),
-            "weight_t":                  l.get("product_uom_qty"),    # tonnes per item
+            "weight_t":                  qty,    # tonnes per item
+            # Flag placeholder/cancelled lines — zero ordered qty should not auto-match
+            "confidence":                "LOW_CONFIDENCE" if qty == 0 else "OK",
             # Description: prefer PO line name (purchaser-entered), fall back to product name
             "description":               (l.get("name") or prod_name or "").strip(),
             "product_name":              prod_name,
