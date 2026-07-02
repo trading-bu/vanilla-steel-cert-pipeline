@@ -296,7 +296,7 @@ def _refs_spec(refs, spec):
 
 
 # ── 4. Items table ────────────────────────────────────────────────────────────
-def _items_table(coils, total_weight):
+def _items_table(coils, total_weight, has_net=True, has_gross=True):
     # Proportional column widths summing to CONTENT_W
     fracs = [0.045, 0.17, 0.12, 0.10, 0.08, 0.08, 0.13, 0.13, 0.065]
     cw = [CONTENT_W * f for f in fracs]
@@ -311,24 +311,33 @@ def _items_table(coils, total_weight):
 
     rows = [header]
     for i, c in enumerate(coils, 1):
+        net_kg   = c.get("weight_kg")
+        gross_kg = c.get("gross_weight_kg")
         rows.append([
-            _p(str(i),                                     S_TD_L),
-            _p(_blank(c.get("coil_no")),                   S_TD_LB),
-            _p(_blank(c.get("cast_no")),                   S_TD_L),
-            _p(_blank(c.get("serial") or c.get("serial_no", "")), S_TD_C),
-            _p(_blank(c.get("thickness_mm")),              S_TD_R),
-            _p(_blank(c.get("width_mm")),                  S_TD_R),
-            _p(_fmtw(c.get("weight_kg")),                  S_TD_R),
-            _p(_blank(c.get("gross_weight_kg", "")),        S_TD_MUT),
-            _p(str(c.get("qty") or 1),                     S_TD_R),
+            _p(str(i),                                               S_TD_L),
+            _p(_blank(c.get("coil_no")),                             S_TD_LB),
+            _p(_blank(c.get("cast_no")),                             S_TD_L),
+            _p(_blank(c.get("serial_no") or c.get("serial", "")),    S_TD_C),
+            _p(_blank(c.get("thickness_mm")),                        S_TD_R),
+            _p(_blank(c.get("width_mm")),                            S_TD_R),
+            _p(_fmtw(net_kg)   if net_kg   is not None else "–",     S_TD_R),
+            _p(_fmtw(gross_kg) if gross_kg is not None else "–",     S_TD_MUT),
+            _p(str(c.get("qty") or 1),                               S_TD_R),
         ])
 
-    # Total row — spans cols 0-5, then net total, gross blank, pcs count
+    # Total row — spans cols 0-5, then net total, gross total, pcs count
+    # If no net weights exist (gross-only cert like ArcelorMittal), put total in gross column
+    if has_net:
+        net_total_str   = _fmtw(total_weight)
+        gross_total_str = ""
+    else:
+        net_total_str   = ""
+        gross_total_str = _fmtw(total_weight)
     total_row = [
         _p(f"Total — {len(coils)} coils", S_TOT_L),
         "", "", "", "", "",
-        _p(_fmtw(total_weight), S_TOT_R),
-        _p("", S_TD_L),
+        _p(net_total_str,   S_TOT_R),
+        _p(gross_total_str, S_TOT_R),
         _p(str(len(coils)), S_TOT_R),
     ]
     rows.append(total_row)
@@ -529,15 +538,20 @@ def generate_certificate(
     dst_addr = odoo_data.get("dest_address",  "") or ""
 
     # Order references
+    # VS reference = SO number from Odoo (e.g. S01464)
+    # Customer order No. = buyer's PO to VS (Odoo client_order_ref), not the cert's mill number
+    # VS PO No. = VS's purchase order to the mill (extracted from cert if it looks like P0XXXX)
+    cert_po  = parsed_cert.get("po_number") or ""
+    odoo_ref = odoo_data.get("vs_reference") or odoo_data.get("so_number") or ""
     refs = [
-        ("VS reference",            odoo_data.get("so_number") or odoo_data.get("vs_reference") or ""),
-        ("Customer order No.",      parsed_cert.get("po_number") or odoo_data.get("customer_po") or ""),
-        ("Mill order No.",          parsed_cert.get("mill_order_no") or ""),
-        ("Agency order No.",        ""),
-        ("Contract No.",            ""),
-        ("Dispatch note",           parsed_cert.get("dispatch_note") or odoo_data.get("delivery_note") or ""),
+        ("VS reference",       odoo_ref),
+        ("Customer order No.", odoo_data.get("customer_po") or ""),
+        ("VS PO No.",          cert_po),
+        ("Mill order No.",     parsed_cert.get("mill_order_no") or ""),
+        ("Contract No.",       ""),
+        ("Dispatch note",      parsed_cert.get("dispatch_note") or odoo_data.get("delivery_note") or ""),
         ("Transport / freight car", ""),
-        ("Marking",                 ""),
+        ("Marking",            ""),
     ]
 
     # Product specification
@@ -552,8 +566,17 @@ def generate_certificate(
         ("Steelmaking process",   parsed_cert.get("steelmaking_process") or ""),
     ]
 
-    total_weight = parsed_cert.get("total_weight_kg") or (
-        sum(float(c.get("weight_kg") or 0) for c in coils) or None)
+    # Prefer explicit total; otherwise sum net weights; fall back to gross weights
+    _net_sum   = sum(float(c.get("weight_kg")       or 0) for c in coils)
+    _gross_sum = sum(float(c.get("gross_weight_kg") or 0) for c in coils)
+    total_weight = (
+        parsed_cert.get("total_weight_kg")
+        or (_net_sum   if _net_sum   > 0 else None)
+        or (_gross_sum if _gross_sum > 0 else None)
+    )
+    # Determine whether we're showing net or gross in the total row
+    _has_net   = any(c.get("weight_kg")       for c in coils)
+    _has_gross = any(c.get("gross_weight_kg") for c in coils)
 
     # ── Story ──────────────────────────────────────────────────────────────────
     story = []
@@ -570,7 +593,7 @@ def generate_certificate(
 
     # Items
     story.append(_sec_hdr("Delivery items & dimensions", "Dimensions in mm · weights in kg"))
-    story.append(_items_table(coils, total_weight))
+    story.append(_items_table(coils, total_weight, _has_net, _has_gross))
     story.append(Spacer(1, 5*mm))
 
     # Mechanical

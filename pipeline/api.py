@@ -12,8 +12,12 @@ Lessons applied from previous Docsumo/GitHub pipeline:
 Body format flexibility:
 - Wrapped:  {"parsed_cert": {...}, "po_number": "..."}   ← original format
 - Raw:      {...cert fields directly...}                  ← Make can send Claude text directly
+
+PO number handling:
+- VS POs follow pattern P0XXXX (e.g. P01755). Only these trigger explicit Odoo lookup.
+- Supplier order numbers (e.g. 41687, 1151079) fall through to auto-match by weight/grade.
 """
-import os
+import os, re
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response, JSONResponse
 from pydantic import BaseModel
@@ -51,18 +55,29 @@ async def _parse_body(request: Request) -> tuple[dict, str]:
         return body, body.get("po_number") or ""
 
 
+_VS_PO_RE = re.compile(r'^P\d{4,}$', re.IGNORECASE)
+
+def _is_vs_po(s: str) -> bool:
+    """True if s looks like a VS Purchase Order number (e.g. P01755, P01234)."""
+    return bool(s and _VS_PO_RE.match(s.strip()))
+
+
 def _odoo_lookup(parsed: dict, po_num: str) -> tuple[dict, str, int]:
     """
     Returns (odoo_data, match_type, match_score).
     match_type: "explicit" | "auto_matched" | "unmatched"
+
+    Only runs an explicit PO lookup if po_num looks like a VS PO (P0XXXX).
+    Supplier-side order numbers (e.g. 41687, 1151079) are NOT VS POs —
+    they fall through to auto-match by weight/grade/dimensions.
     """
-    if po_num:
+    if po_num and _is_vs_po(po_num):
         try:
-            data = odoo.get_neutralisation_data(po_num)
+            data = odoo.get_neutralisation_data(po_num.strip().upper())
             return data, "explicit", 13
         except Exception as e:
             print(f"[Odoo] explicit lookup failed for {po_num}: {e}")
-            return {}, "unmatched", 0
+            # Fall through to auto-match rather than returning unmatched immediately
 
     # Auto-match
     try:

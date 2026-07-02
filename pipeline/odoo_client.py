@@ -202,19 +202,11 @@ def get_neutralisation_data(vs_po_number: str) -> dict:
     product_detail: dict[int, dict] = {}
     if product_ids:
         try:
+            # Fetch standard product fields only — avoid custom x_ fields that may not exist
             rows = _call(
                 "product.product", "read",
                 [list(set(product_ids))],
-                {"fields": [
-                    "id", "name",
-                    # Common custom-field names VS might use — graceful fallback if absent
-                    "x_grade", "x_studio_grade",
-                    "x_width_mm", "x_studio_width_mm",
-                    "x_thickness_mm", "x_studio_thickness_mm",
-                    "x_coating", "x_studio_coating",
-                    "x_steelmaking", "x_studio_steelmaking",
-                    "x_material_type", "x_studio_material_type",
-                ]}
+                {"fields": ["id", "name"]}
             )
             for r in rows:
                 product_detail[r["id"]] = r
@@ -281,6 +273,8 @@ def get_neutralisation_data(vs_po_number: str) -> dict:
     buyer_name    = ""
     buyer_country = ""
     buyer_address = ""
+    dest_name     = ""
+    dest_address  = ""
     vs_reference  = ""
     customer_po   = ""
     delivery_note = ""
@@ -297,43 +291,75 @@ def get_neutralisation_data(vs_po_number: str) -> dict:
                 so_records = _call(
                     "sale.order", "read", [[so_id]],
                     {"fields": [
-                        "name",               # S01501 — the SO number
-                        "partner_id",         # billing contact
-                        "partner_shipping_id",# shipping address (buyer's warehouse)
-                        "client_order_ref",   # customer's own PO number
-                        "x_vs_reference",     # VSO number (custom field — may not exist)
+                        "name",                # S01501 — the SO number
+                        "partner_id",          # billing/consignee contact
+                        "partner_shipping_id", # shipping address (delivery point)
+                        "client_order_ref",    # customer's own PO number to VS
                     ]}
                 )
                 if so_records:
                     so   = so_records[0]
                     so_number    = so.get("name", "")
                     customer_po  = so.get("client_order_ref") or ""
-                    vs_reference = so.get("x_vs_reference") or so_number  # fall back to SO name
+                    vs_reference = so_number  # SO name IS the VS reference
 
-                    # ── Shipping address ──────────────────────────────────────
-                    shipping_partner_id = (so.get("partner_shipping_id") or [None])[0]
                     billing_partner_id  = (so.get("partner_id") or [None])[0]
-                    # Prefer shipping address; fall back to billing contact
-                    addr_id = shipping_partner_id or billing_partner_id
-                    if addr_id:
+                    shipping_partner_id = (so.get("partner_shipping_id") or [None])[0]
+
+                    # ── Consignee = billing partner (company VS sold to) ────────
+                    if billing_partner_id:
                         partners = _call(
-                            "res.partner", "read", [[addr_id]],
+                            "res.partner", "read", [[billing_partner_id]],
                             {"fields": ["name", "street", "street2",
-                                        "city", "zip", "country_id"]}
+                                        "city", "zip", "country_id",
+                                        "is_company", "parent_id"]}
                         )
                         if partners:
                             p = partners[0]
+                            # If this is an individual contact, prefer their parent company
+                            if not p.get("is_company") and p.get("parent_id"):
+                                parent_id = p["parent_id"][0]
+                                parent = _call(
+                                    "res.partner", "read", [[parent_id]],
+                                    {"fields": ["name", "street", "street2",
+                                                "city", "zip", "country_id"]}
+                                )
+                                if parent:
+                                    p = parent[0]
                             buyer_name    = p.get("name", "")
                             country_field = p.get("country_id")
                             buyer_country = country_field[1] if country_field else ""
-                            # Build a single-line address string
                             parts = [
                                 p.get("street") or "",
                                 p.get("street2") or "",
                                 " ".join(filter(None, [p.get("zip", ""), p.get("city", "")])),
                                 buyer_country,
                             ]
-                            buyer_address = ", ".join(p for p in parts if p)
+                            buyer_address = ", ".join(x for x in parts if x)
+
+                    # ── Destination = shipping address (if different from billing) ──
+                    if shipping_partner_id and shipping_partner_id != billing_partner_id:
+                        partners = _call(
+                            "res.partner", "read", [[shipping_partner_id]],
+                            {"fields": ["name", "street", "street2",
+                                        "city", "zip", "country_id", "parent_id"]}
+                        )
+                        if partners:
+                            p = partners[0]
+                            country_field = p.get("country_id")
+                            dest_country  = country_field[1] if country_field else ""
+                            parts = [
+                                p.get("street") or "",
+                                p.get("street2") or "",
+                                " ".join(filter(None, [p.get("zip", ""), p.get("city", "")])),
+                                dest_country,
+                            ]
+                            dest_name    = p.get("name", "")
+                            dest_address = ", ".join(x for x in parts if x)
+                    else:
+                        # Shipping same as billing — destination = consignee
+                        dest_name    = buyer_name
+                        dest_address = buyer_address
                 break  # Found SO — stop
 
     # 5. Delivery note: find done stock.picking records that contain our VSI lines
@@ -367,11 +393,13 @@ def get_neutralisation_data(vs_po_number: str) -> dict:
 
     return {
         "so_number":      so_number,
-                "vs_reference":   vs_reference,
-        "customer_po":    customer_po,
-        "buyer_name":     buyer_name,
+        "vs_reference":   vs_reference,   # = so_number (the VS SO ref)
+        "customer_po":    customer_po,    # = client_order_ref (buyer's PO to VS)
+        "buyer_name":     buyer_name,     # consignee company name
         "buyer_country":  buyer_country,
-        "buyer_address":  buyer_address,
+        "buyer_address":  buyer_address,  # consignee address
+        "dest_name":      dest_name,      # destination name (shipping address)
+        "dest_address":   dest_address,   # destination address
         "delivery_note":  delivery_note,
         "vs_articles":    vs_articles,
     }
