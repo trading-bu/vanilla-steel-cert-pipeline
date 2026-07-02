@@ -88,8 +88,10 @@ def _odoo_lookup(parsed, po_num):
         signals = {
             "weight_kg":     parsed.get("total_weight_kg"),
             "grade":         parsed.get("grade", ""),
+            "grade_full":    parsed.get("grade_full", ""),   # e.g. "DX51D+Z275-M-A-C"
             "material_type": parsed.get("material_type", ""),
-            "quality":       parsed.get("quality", ""),
+            "quality":       parsed.get("quality", ""),      # coating class or choice
+            "coating":       parsed.get("coating", ""),      # e.g. "Magnelis ZM310 155/155 g/m²"
             "width_mm":      first_coil.get("width_mm", ""),
             "thickness_mm":  first_coil.get("thickness_mm", ""),
         }

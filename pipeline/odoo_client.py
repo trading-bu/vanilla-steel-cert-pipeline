@@ -92,20 +92,68 @@ def _choice_norm(s: str) -> str | None:
     return None
 
 
+
+# Marketing prefixes suppliers prepend to base grades before comparison
+_GRADE_PREFIX_RE = re.compile(
+    r"^(MAGNELIS|GALV|PREBOND|EXTRAGAL|SENDZIMIR|GALFAN|ALUZINC|ALUSI|ZINCOR|GALFLEX|GALMAG)[\-\s]+",
+    re.IGNORECASE,
+)
+
+
+def _strip_grade_prefix(s: str) -> str:
+    """Strip supplier marketing prefix before grade comparison.
+
+    'MAGNELIS-S220GD+ZM310' → 'S220GD+ZM310'
+    'GALV-DX51D+Z275'       → 'DX51D+Z275'
+    """
+    return _GRADE_PREFIX_RE.sub("", (s or "").strip())
+
+
+# Coating designation codes: Z275, ZM310, AZ150, ZA255, AS80 …
+_COATING_CODE_RE = re.compile(
+    r"\b(ZM\s*\d+|Z\s*\d+|AZ\s*\d+|ZA\s*\d+|AS\s*\d+|ZF\s*\d+)\b",
+    re.IGNORECASE,
+)
+
+
+def _extract_coating_code(s: str) -> str:
+    """Extract the coating designation from a full coating description.
+
+    'Magnelis ZM310 155/155 g/m²' → 'ZM310'
+    'hot dip galv Z275-MA-C'      → 'Z275'
+    'DX51D+Z275-M-A-C'            → 'Z275'
+    Returns '' when no coating code found.
+    """
+    m = _COATING_CODE_RE.search(s or "")
+    return re.sub(r"\s+", "", m.group(0)).upper() if m else ""
+
+
 def _score_line(line: dict, cert: dict) -> int:
     """
-    Score an Odoo PO line against cert signals.  Max = 13.
+    Score an Odoo PO aggregate against cert signals.  Max = 15.
 
-    line keys expected: weight_t, grade, choice, form, finish, coating,
-                        width_mm, thickness_mm
-    cert keys expected: weight_kg, grade, material_type, quality,
-                        width_mm, thickness_mm
+    Scoring breakdown:
+      weight    max 5   — PO total vs cert total weight
+      grade     max 3   — spec token cross-match (prefixes stripped, grade_full pooled)
+      coating   max 2   — coating code match (Z275, ZM310 …) as a SEPARATE signal
+      choice    max 1   — first/second choice
+      width     max 2   — ±2 mm tolerance
+      thickness max 2   — ±0.1 mm tolerance
+
+    A cert matching grade + coating + width + thickness (9 pts) reaches the
+    auto-match threshold of 8 even when weight is unknown / mismatched,
+    which is the correct behaviour for multi-coil deliveries.
+
+    line keys expected : weight_t, grade, choice, form, finish, coating,
+                         width_mm, thickness_mm
+    cert keys expected : weight_kg, grade, grade_full, material_type, quality,
+                         coating, width_mm, thickness_mm
     """
     score = 0
 
-    # ── Weight (most discriminating) — max 5 pts ──────────────────────────
+    # ── Weight — max 5 pts ────────────────────────────────────────────────
     odoo_kg = (line.get("weight_t") or 0) * 1000
-    cert_kg  = cert.get("weight_kg") or 0
+    cert_kg = cert.get("weight_kg") or 0
     if odoo_kg > 0 and cert_kg > 0:
         pct = abs(odoo_kg - cert_kg) / odoo_kg
         if   pct <= 0.02: score += 5
@@ -113,19 +161,27 @@ def _score_line(line: dict, cert: dict) -> int:
         elif pct <= 0.10: score += 1
 
     # ── Grade / spec cross-match — max 3 pts ──────────────────────────────
-    # Pool ALL spec-like Odoo fields: grade, form, finish, coating.
-    # Any of these might appear under "grade" on a supplier cert.
+    # Strip marketing prefixes on both sides, then pool tokens from all
+    # spec-like fields. grade_full (e.g. "DX51D+Z275-M-A-C") is included
+    # from the cert side so the base grade still matches even with suffixes.
     odoo_tok: set = set()
     for f in ("grade", "form", "finish", "coating"):
-        odoo_tok |= _spec_tokens(line.get(f) or "")
+        odoo_tok |= _spec_tokens(_strip_grade_prefix(line.get(f) or ""))
 
-    # Pool cert's spec fields (Docsumo grade, material_type, quality).
     cert_tok: set = set()
-    for f in ("grade", "material_type", "quality"):
-        cert_tok |= _spec_tokens(cert.get(f) or "")
+    for f in ("grade", "grade_full", "material_type"):
+        cert_tok |= _spec_tokens(_strip_grade_prefix(cert.get(f) or ""))
 
     if odoo_tok and cert_tok and (odoo_tok & cert_tok):
         score += 3
+
+    # ── Coating code — max 2 pts ──────────────────────────────────────────
+    # Separate signal: extract the coating designation (Z275, ZM310 …) from
+    # the full coating description on each side and compare directly.
+    cert_coat = _extract_coating_code(cert.get("coating") or cert.get("quality") or "")
+    odoo_coat = _extract_coating_code(line.get("coating") or "")
+    if cert_coat and odoo_coat and cert_coat == odoo_coat:
+        score += 2
 
     # ── Choice / quality match — max 1 pt ─────────────────────────────────
     odoo_ch = _choice_norm(line.get("choice") or "")
