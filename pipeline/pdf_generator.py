@@ -538,15 +538,13 @@ def generate_certificate(
     dst_addr = odoo_data.get("dest_address",  "") or ""
 
     # Order references
-    # VS reference = SO number from Odoo (e.g. S01464)
-    # Customer order No. = buyer's PO to VS (Odoo client_order_ref), not the cert's mill number
-    # VS PO No. = VS's purchase order to the mill (extracted from cert if it looks like P0XXXX)
-    cert_po  = parsed_cert.get("po_number") or ""
-    odoo_ref = odoo_data.get("vs_reference") or odoo_data.get("so_number") or ""
+    # VS SO No. = VS Sales Order number from Odoo (e.g. S01464)
+    # Customer order No. = buyer's PO to VS (Odoo client_order_ref)
+    so_number = odoo_data.get("so_number") or odoo_data.get("vs_reference") or ""
     refs = [
-        ("VS reference",       odoo_ref),
+        ("VS reference",       so_number),
         ("Customer order No.", odoo_data.get("customer_po") or ""),
-        ("VS PO No.",          cert_po),
+        ("VS SO No.",          so_number),
         ("Mill order No.",     parsed_cert.get("mill_order_no") or ""),
         ("Contract No.",       ""),
         ("Dispatch note",      parsed_cert.get("dispatch_note") or odoo_data.get("delivery_note") or ""),
