@@ -538,11 +538,13 @@ def generate_certificate(
     dst_addr = odoo_data.get("dest_address",  "") or ""
 
     # Order references
-    # VS SO No. = VS Sales Order number from Odoo (e.g. S01464)
+    # VS reference = deal_reference from Odoo (VSO-XXXX)
+    # VS SO No.    = SO number from Odoo (S01512)
     # Customer order No. = buyer's PO to VS (Odoo client_order_ref)
-    so_number = odoo_data.get("so_number") or odoo_data.get("vs_reference") or ""
+    so_number    = odoo_data.get("so_number") or ""
+    vs_reference = odoo_data.get("vs_reference") or ""   # deal_reference (VSO-XXXX)
     refs = [
-        ("VS reference",       so_number),
+        ("VS reference",       vs_reference),
         ("Customer order No.", odoo_data.get("customer_po") or ""),
         ("VS SO No.",          so_number),
         ("Mill order No.",     parsed_cert.get("mill_order_no") or ""),
@@ -626,5 +628,5 @@ def generate_certificate(
         id="main", frames=[frame],
         onPage=lambda c, d: _draw_page(c, d, logo_path, vs_cert_no, mill_cert_no),
     )])
-    doc.build(story, canvasmaker=_NumberedCanvas)
-    return buf.getvalue()
+    doc.build(story)
+    return buf.getvalue())

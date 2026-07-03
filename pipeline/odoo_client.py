@@ -354,13 +354,14 @@ def get_neutralisation_data(vs_po_number: str) -> dict:
                         "partner_id",          # billing/consignee contact
                         "partner_shipping_id", # shipping address (delivery point)
                         "client_order_ref",    # customer's own PO number to VS
+                        "deal_reference",      # VSO-XXXX — the VS deal/reference number
                     ]}
                 )
                 if so_records:
                     so   = so_records[0]
                     so_number    = so.get("name", "")
                     customer_po  = so.get("client_order_ref") or ""
-                    vs_reference = so_number  # SO name IS the VS reference
+                    vs_reference = so.get("deal_reference") or ""  # VSO-XXXX
 
                     billing_partner_id  = (so.get("partner_id") or [None])[0]
                     shipping_partner_id = (so.get("partner_shipping_id") or [None])[0]
