@@ -451,6 +451,7 @@ def get_neutralisation_data(vs_po_number: str) -> dict:
           f"Buyer={buyer_name} | Delivery={delivery_note or '(pending)'}")
 
     return {
+        "po_number":      vs_po_number,   # VS PO number this data was fetched for
         "so_number":      so_number,
         "vs_reference":   vs_reference,   # = so_number (the VS SO ref)
         "customer_po":    customer_po,    # = client_order_ref (buyer's PO to VS)

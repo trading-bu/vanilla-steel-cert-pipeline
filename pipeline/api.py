@@ -125,7 +125,7 @@ async def match_cert(request: Request):
     return {
         "match_type":       match_type,
         "match_score":      score,
-        "po_number":        po_num or odoo_data.get("po_number", ""),
+        "po_number":        po_num or odoo_data.get("po_number", "") or parsed.get("po_number", ""),
         "so_number":        odoo_data.get("so_number", ""),
         "buyer_name":       odoo_data.get("buyer_name", ""),
         "buyer_country":    odoo_data.get("buyer_country", ""),
