@@ -629,4 +629,4 @@ def generate_certificate(
         onPage=lambda c, d: _draw_page(c, d, logo_path, vs_cert_no, mill_cert_no),
     )])
     doc.build(story)
-    return buf.getvalue())
+    return buf.getvalue()
