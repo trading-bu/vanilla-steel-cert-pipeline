@@ -10,9 +10,22 @@ Body format flexibility:
 PO number handling:
 - VS POs follow pattern P0XXXX (e.g. P01755). Only these trigger explicit Odoo lookup.
 - Supplier order numbers fall through to auto-match by weight/grade.
+
+Slack interactive flow (no PO on cert):
+- POST /pending-cert  : stores cert, posts Slack message with "Enter PO Number" button
+- POST /slack/interactive : handles button click (opens modal) + modal submission (generates cert)
+- Persistent storage: JSON file at PENDING_CERTS_FILE (default /data/pending_certs.json)
+  Requires a Railway Volume mounted at /data to survive restarts.
 """
 import os
 import re
+import json
+import uuid
+import hmac
+import hashlib
+import time
+import urllib.request
+import urllib.parse
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
 
@@ -21,14 +34,113 @@ from pdf_generator import generate_certificate
 
 app = FastAPI(title="VS Cert Generator")
 
-ODOO_API_KEY = os.environ.get("ODOO_API_KEY", "")
-LOGO_PATH    = os.environ.get("LOGO_PATH", "")
+ODOO_API_KEY          = os.environ.get("ODOO_API_KEY", "")
+LOGO_PATH             = os.environ.get("LOGO_PATH", "")
+SLACK_BOT_TOKEN       = os.environ.get("SLACK_BOT_TOKEN", "")
+SLACK_SIGNING_SECRET  = os.environ.get("SLACK_SIGNING_SECRET", "")
+SLACK_CHANNEL_ID      = os.environ.get("SLACK_CHANNEL_ID", "")
+PENDING_CERTS_FILE    = os.environ.get("PENDING_CERTS_FILE", "/data/pending_certs.json")
 
 
 @app.on_event("startup")
 def startup():
     if ODOO_API_KEY:
         odoo.set_api_key(ODOO_API_KEY)
+    # Ensure data directory exists
+    os.makedirs(os.path.dirname(PENDING_CERTS_FILE), exist_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Persistent cert storage (JSON file on Railway Volume at /data)
+# ---------------------------------------------------------------------------
+
+def _load_pending() -> dict:
+    try:
+        with open(PENDING_CERTS_FILE, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_pending(data: dict):
+    with open(PENDING_CERTS_FILE, "w") as f:
+        json.dump(data, f)
+
+
+def _store_cert(cert_id: str, cert_data: dict):
+    pending = _load_pending()
+    pending[cert_id] = cert_data
+    _save_pending(pending)
+
+
+def _pop_cert(cert_id: str) -> dict:
+    pending = _load_pending()
+    cert = pending.pop(cert_id, None)
+    _save_pending(pending)
+    return cert
+
+
+# ---------------------------------------------------------------------------
+# Slack helpers
+# ---------------------------------------------------------------------------
+
+def _verify_slack_signature(body: bytes, timestamp: str, signature: str) -> bool:
+    """Reject requests older than 5 min or with bad HMAC."""
+    try:
+        if abs(time.time() - int(timestamp)) > 300:
+            return False
+    except ValueError:
+        return False
+    sig_base = f"v0:{timestamp}:{body.decode()}".encode()
+    expected = "v0=" + hmac.new(
+        SLACK_SIGNING_SECRET.encode(), sig_base, hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature)
+
+
+def _slack_api(method: str, data: dict) -> dict:
+    url = f"https://slack.com/api/{method}"
+    payload = json.dumps(data).encode()
+    req = urllib.request.Request(url, data=payload, headers={
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
+    })
+    with urllib.request.urlopen(req) as resp:
+        return json.loads(resp.read())
+
+
+def _slack_upload_pdf(pdf_bytes: bytes, filename: str, channel_id: str,
+                      thread_ts: str, comment: str):
+    """Upload a PDF to Slack using the v2 external upload API."""
+    # Step 1: get upload URL
+    url_resp = _slack_api("files.getUploadURLExternal", {
+        "filename": filename,
+        "length": len(pdf_bytes),
+    })
+    if not url_resp.get("ok"):
+        raise RuntimeError(f"files.getUploadURLExternal failed: {url_resp.get('error')}")
+
+    upload_url = url_resp["upload_url"]
+    file_id    = url_resp["file_id"]
+
+    # Step 2: PUT bytes to the pre-signed URL
+    put_req = urllib.request.Request(
+        upload_url, data=pdf_bytes, method="POST",
+        headers={"Content-Type": "application/octet-stream"},
+    )
+    with urllib.request.urlopen(put_req):
+        pass
+
+    # Step 3: complete upload, post to channel/thread
+    complete_data = {
+        "files":           [{"id": file_id, "title": filename}],
+        "channel_id":      channel_id,
+        "initial_comment": comment,
+    }
+    if thread_ts:
+        complete_data["thread_ts"] = thread_ts
+
+    _slack_api("files.completeUploadExternal", complete_data)
 
 
 # ---------------------------------------------------------------------------
@@ -88,10 +200,10 @@ def _odoo_lookup(parsed, po_num):
         signals = {
             "weight_kg":     parsed.get("total_weight_kg"),
             "grade":         parsed.get("grade", ""),
-            "grade_full":    parsed.get("grade_full", ""),   # e.g. "DX51D+Z275-M-A-C"
+            "grade_full":    parsed.get("grade_full", ""),
             "material_type": parsed.get("material_type", ""),
-            "quality":       parsed.get("quality", ""),      # coating class or choice
-            "coating":       parsed.get("coating", ""),      # e.g. "Magnelis ZM310 155/155 g/m²"
+            "quality":       parsed.get("quality", ""),
+            "coating":       parsed.get("coating", ""),
             "width_mm":      first_coil.get("width_mm", ""),
             "thickness_mm":  first_coil.get("thickness_mm", ""),
         }
@@ -110,7 +222,7 @@ def _odoo_lookup(parsed, po_num):
 
 
 # ---------------------------------------------------------------------------
-# Endpoints
+# Endpoints — standard flow
 # ---------------------------------------------------------------------------
 
 @app.post("/match-cert")
@@ -123,17 +235,17 @@ async def match_cert(request: Request):
     odoo_data, match_type, score = _odoo_lookup(parsed, po_num)
 
     return {
-        "match_type":       match_type,
-        "match_score":      score,
-        "po_number":        po_num or odoo_data.get("po_number", "") or parsed.get("po_number", ""),
-        "so_number":        odoo_data.get("so_number", ""),
-        "buyer_name":       odoo_data.get("buyer_name", ""),
-        "buyer_country":    odoo_data.get("buyer_country", ""),
-        "odoo_data":        odoo_data,
-        "cert_number":      parsed.get("cert_number", ""),
-        "grade":            parsed.get("grade", ""),
-        "total_weight_kg":  parsed.get("total_weight_kg"),
-        "coil_count":       len(parsed.get("coils") or []),
+        "match_type":        match_type,
+        "match_score":       score,
+        "po_number":         po_num or odoo_data.get("po_number", "") or parsed.get("po_number", ""),
+        "so_number":         odoo_data.get("so_number", ""),
+        "buyer_name":        odoo_data.get("buyer_name", ""),
+        "buyer_country":     odoo_data.get("buyer_country", ""),
+        "odoo_data":         odoo_data,
+        "cert_number":       parsed.get("cert_number", ""),
+        "grade":             parsed.get("grade", ""),
+        "total_weight_kg":   parsed.get("total_weight_kg"),
+        "coil_count":        len(parsed.get("coils") or []),
         "needs_slack_input": match_type == "unmatched",
         "warning": (
             "No Odoo match found"
@@ -150,7 +262,6 @@ async def generate(request: Request):
     """
     parsed, po_num = await _parse_body(request)
 
-    # Validate extraction
     coils = parsed.get("coils") or []
     if not coils:
         raise HTTPException(
@@ -183,6 +294,202 @@ async def generate(request: Request):
             "X-SO-Number":   odoo_data.get("so_number", ""),
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# Endpoints — Slack interactive flow (no PO number on cert)
+# ---------------------------------------------------------------------------
+
+@app.post("/pending-cert")
+async def pending_cert(request: Request):
+    """
+    Called by Make.com when Claude extracts a cert with no PO number.
+    Stores the cert and posts an interactive Slack message asking for the PO.
+    """
+    body = await request.json()
+    parsed = body.get("parsed_cert") or body
+
+    cert_id  = str(uuid.uuid4())
+    _store_cert(cert_id, parsed)
+
+    supplier  = parsed.get("supplier_name") or parsed.get("manufacturer") or "Unknown supplier"
+    mill_cert = parsed.get("cert_number") or parsed.get("mill_cert_number") or "—"
+    weight_kg = parsed.get("total_weight_kg")
+    weight_str = f"{weight_kg / 1000:.2f}t" if weight_kg else "—"
+    coils     = len(parsed.get("coils") or [])
+    grade     = parsed.get("grade") or parsed.get("material_type") or "—"
+
+    result = _slack_api("chat.postMessage", {
+        "channel": SLACK_CHANNEL_ID,
+        "blocks": [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        f"📄 *New cert received — no PO number found*\n\n"
+                        f"*Supplier:* {supplier}\n"
+                        f"*Mill cert no:* {mill_cert}\n"
+                        f"*Total weight:* {weight_str}  |  *Coils:* {coils}\n"
+                        f"*Grade:* {grade}\n\n"
+                        f"Please enter the VS PO number to continue processing."
+                    ),
+                },
+            },
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "Enter PO Number"},
+                        "style": "primary",
+                        "action_id": "open_po_modal",
+                        "value": cert_id,
+                    }
+                ],
+            },
+        ],
+    })
+
+    if not result.get("ok"):
+        raise HTTPException(status_code=500, detail=f"Slack error: {result.get('error')}")
+
+    return {"status": "pending", "cert_id": cert_id}
+
+
+@app.post("/slack/interactive")
+async def slack_interactive(request: Request):
+    """
+    Slack posts here for all interactive events:
+      - block_actions : user clicked "Enter PO Number" → open modal
+      - view_submission : user submitted PO number → match + generate + upload PDF
+    """
+    raw_body  = await request.body()
+    timestamp = request.headers.get("X-Slack-Request-Timestamp", "")
+    signature = request.headers.get("X-Slack-Signature", "")
+
+    if SLACK_SIGNING_SECRET and not _verify_slack_signature(raw_body, timestamp, signature):
+        raise HTTPException(status_code=403, detail="Invalid Slack signature")
+
+    form    = urllib.parse.parse_qs(raw_body.decode())
+    payload = json.loads(form.get("payload", ["{}"])[0])
+
+    # ── Button click: open the PO input modal ───────────────────────────────
+    if payload.get("type") == "block_actions":
+        action     = (payload.get("actions") or [{}])[0]
+        cert_id    = action.get("value", "")
+        trigger_id = payload.get("trigger_id", "")
+        channel_id = payload.get("channel", {}).get("id", "") or SLACK_CHANNEL_ID
+        message_ts = payload.get("message", {}).get("ts", "")
+
+        _slack_api("views.open", {
+            "trigger_id": trigger_id,
+            "view": {
+                "type":            "modal",
+                "callback_id":     "po_modal",
+                "private_metadata": json.dumps({
+                    "cert_id":    cert_id,
+                    "channel_id": channel_id,
+                    "message_ts": message_ts,
+                }),
+                "title":  {"type": "plain_text", "text": "Enter PO Number"},
+                "submit": {"type": "plain_text", "text": "Submit"},
+                "close":  {"type": "plain_text", "text": "Cancel"},
+                "blocks": [
+                    {
+                        "type":     "input",
+                        "block_id": "po_block",
+                        "label":    {"type": "plain_text", "text": "VS PO Number"},
+                        "hint":     {"type": "plain_text", "text": "Format: P0XXXX — e.g. P01755"},
+                        "element":  {
+                            "type":        "plain_text_input",
+                            "action_id":   "po_input",
+                            "placeholder": {"type": "plain_text", "text": "P01755"},
+                        },
+                    }
+                ],
+            },
+        })
+        return Response(content="", status_code=200)
+
+    # ── Modal submission: process PO number ─────────────────────────────────
+    if payload.get("type") == "view_submission":
+        view = payload.get("view", {})
+        if view.get("callback_id") != "po_modal":
+            return Response(content="", status_code=200)
+
+        meta       = json.loads(view.get("private_metadata", "{}"))
+        cert_id    = meta.get("cert_id", "")
+        channel_id = meta.get("channel_id") or SLACK_CHANNEL_ID
+        message_ts = meta.get("message_ts", "")
+
+        values = view.get("state", {}).get("values", {})
+        po_num = values.get("po_block", {}).get("po_input", {}).get("value", "").strip()
+
+        # Validate PO format
+        if not _is_vs_po(po_num):
+            return {
+                "response_action": "errors",
+                "errors": {"po_block": f"'{po_num}' doesn't look like a VS PO number (expected P0XXXX). Please check and try again."},
+            }
+
+        # Load stored cert
+        cert_data = _pop_cert(cert_id)
+        if not cert_data:
+            return {
+                "response_action": "errors",
+                "errors": {"po_block": "Cert data not found — it may have been processed already or the server was restarted. Please re-run the cert through Make.com."},
+            }
+
+        # Odoo lookup
+        odoo_data, match_type, score = _odoo_lookup(cert_data, po_num)
+
+        if match_type == "unmatched":
+            # Put cert back so user can try a different PO
+            _store_cert(cert_id, cert_data)
+            return {
+                "response_action": "errors",
+                "errors": {"po_block": f"PO {po_num} not found in Odoo. Please check the number and try again."},
+            }
+
+        # Generate PDF
+        try:
+            pdf_bytes = generate_certificate(
+                parsed_cert=cert_data,
+                odoo_data=odoo_data,
+                logo_path=LOGO_PATH or None,
+            )
+        except Exception as exc:
+            _store_cert(cert_id, cert_data)
+            return {
+                "response_action": "errors",
+                "errors": {"po_block": f"PDF generation failed: {exc}"},
+            }
+
+        # Upload PDF to Slack thread
+        supplier = cert_data.get("supplier_name") or cert_data.get("manufacturer") or "cert"
+        so_num   = odoo_data.get("so_number", "")
+        filename = f"neutralised_{supplier.replace(' ', '_')}_{po_num}.pdf"
+        comment  = (
+            f"✅ *Neutralised cert generated*\n"
+            f"PO: `{po_num}` · SO: `{so_num}` · Match score: {score}"
+        )
+
+        try:
+            _slack_upload_pdf(pdf_bytes, filename, channel_id, message_ts, comment)
+        except Exception as exc:
+            print(f"[Slack] PDF upload failed: {exc}")
+            # Still close the modal — cert was generated, just notify in thread
+            _slack_api("chat.postMessage", {
+                "channel":   channel_id,
+                "thread_ts": message_ts,
+                "text":      f"✅ Cert generated (PO `{po_num}`, SO `{so_num}`) but PDF upload failed: {exc}",
+            })
+
+        # Close the modal
+        return {"response_action": "clear"}
+
+    return Response(content="", status_code=200)
 
 
 @app.get("/health")
