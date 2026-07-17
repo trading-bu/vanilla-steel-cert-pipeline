@@ -166,11 +166,18 @@ async def _parse_body(request: Request):
 # PO format helper
 # ---------------------------------------------------------------------------
 
-_VS_PO_RE = re.compile(r"^P\d{4,}$", re.IGNORECASE)
+_VS_PO_RE = re.compile(r"^P[O0]\d{4}$", re.IGNORECASE)
 
 
 def _is_vs_po(s):
     return bool(s and _VS_PO_RE.match(s.strip()))
+
+
+def _normalise_po(s: str) -> str:
+    """Normalise POXXXX (letter O) → P0XXXX (digit zero)."""
+    if s and len(s) == 6 and s[0].upper() == "P" and s[1].upper() == "O":
+        return "P0" + s[2:]
+    return s
 
 
 # ---------------------------------------------------------------------------
@@ -189,7 +196,8 @@ def _odoo_lookup(parsed, po_num):
     # 1. VS PO number on cert
     if po_num and _is_vs_po(po_num):
         try:
-            data = odoo.get_neutralisation_data(po_num.strip().upper())
+            po_num = _normalise_po(po_num.strip().upper())
+            data = odoo.get_neutralisation_data(po_num)
             return data, "explicit", 13
         except Exception as exc:
             print("[Odoo] explicit lookup failed for %s: %s" % (po_num, exc))
@@ -424,7 +432,7 @@ async def slack_interactive(request: Request):
         message_ts = meta.get("message_ts", "")
 
         values = view.get("state", {}).get("values", {})
-        po_num = values.get("po_block", {}).get("po_input", {}).get("value", "").strip()
+        po_num = _normalise_po(values.get("po_block", {}).get("po_input", {}).get("value", "").strip().upper())
 
         # Validate PO format
         if not _is_vs_po(po_num):
