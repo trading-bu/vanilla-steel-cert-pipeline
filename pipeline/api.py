@@ -449,15 +449,18 @@ async def slack_interactive(request: Request):
                 "errors": {"po_block": "Cert data not found — it may have been processed already or the server was restarted. Please re-run the cert through Make.com."},
             }
 
-        # Odoo lookup
-        odoo_data, match_type, score = _odoo_lookup(cert_data, po_num)
-
-        if match_type == "unmatched":
-            # Put cert back so user can try a different PO
-            _store_cert(cert_id, cert_data)
+        # Odoo lookup — call directly so the real error surfaces in the modal
+        try:
+            odoo_data  = odoo.get_neutralisation_data(po_num)
+            match_type = "explicit"
+            score      = 13
+        except Exception as exc:
+            _store_cert(cert_id, cert_data)  # put back so user can retry
+            err_msg = str(exc)
+            print(f"[Odoo] Slack modal lookup failed for {po_num}: {err_msg}")
             return {
                 "response_action": "errors",
-                "errors": {"po_block": f"PO {po_num} not found in Odoo. Please check the number and try again."},
+                "errors": {"po_block": f"Odoo error for {po_num}: {err_msg}"},
             }
 
         # Generate PDF

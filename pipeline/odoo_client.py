@@ -221,14 +221,22 @@ def get_neutralisation_data(vs_po_number: str) -> dict:
     """
     print(f"[Odoo] Looking up data for PO: {vs_po_number}")
 
-    # 1. Find the purchase order (no sale_order_id — field doesn't exist in Odoo 19)
+    # 1. Find the purchase order — try purchase_order_id field first (VS internal PO ref),
+    #    fall back to name field.
     po_records = _call(
         "purchase.order", "search_read",
-        [[["name", "=", vs_po_number]]],
-        {"fields": ["id", "name"], "limit": 1}
+        [[["purchase_order_id", "=", vs_po_number]]],
+        {"fields": ["id", "name", "purchase_order_id"], "limit": 1}
     )
     if not po_records:
-        raise ValueError(f"No purchase order found in Odoo for '{vs_po_number}'")
+        # Fallback: try by Odoo name field
+        po_records = _call(
+            "purchase.order", "search_read",
+            [[["name", "=", vs_po_number]]],
+            {"fields": ["id", "name", "purchase_order_id"], "limit": 1}
+        )
+    if not po_records:
+        raise ValueError(f"No purchase order found in Odoo for '{vs_po_number}' (searched purchase_order_id and name)")
 
     po = po_records[0]
     po_id = po["id"]
