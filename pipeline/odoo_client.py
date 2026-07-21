@@ -234,11 +234,12 @@ def get_neutralisation_data(vs_po_number: str) -> dict:
     po_name = po_records[0]["name"]
     print(f"[Odoo] Found PO id={po_id} name={po_name}")
 
+
     # 2. Get all purchase order lines.
     #    Start with fields confirmed to exist, then try optional custom fields.
     _SAFE_LINE_FIELDS = [
         "id", "vs_article", "aoo_fast_number",
-        "original_supplier_article", "sale_line_id",
+        "original_supplier_article", "sale_order_id", "sale_line_id",
         "product_uom_qty", "name", "product_id",
     ]
     _OPTIONAL_LINE_FIELDS = [
@@ -331,14 +332,15 @@ def get_neutralisation_data(vs_po_number: str) -> dict:
               f"grade: '{sample['grade']}' | quality: '{sample['quality']}' | "
               f"w×t: {sample['width_mm']}×{sample['thickness_mm']}")
 
-    # 3. Collect all sale_line_ids from PO lines (needed for delivery note matching)
+    # 3. Collect sale_line_ids from PO lines (for delivery note lookup)
     sale_line_ids = [
         l["sale_line_id"][0]
         for l in po_lines
         if l.get("sale_line_id") and isinstance(l["sale_line_id"], list)
     ]
 
-    # 4. Get the linked Sales Order via sale_line_id on PO lines
+    # 4. Get the linked SO via sale_order_id directly on the PO line
+    #    (field map: purchase.order.line.sale_order_id → sale.order)
     so_number     = ""
     so_id         = None
     buyer_name    = ""
@@ -351,88 +353,79 @@ def get_neutralisation_data(vs_po_number: str) -> dict:
     delivery_note = ""
 
     for line in po_lines:
-        if line.get("sale_line_id"):
-            sale_line_id = line["sale_line_id"][0]
-            sol = _call(
-                "sale.order.line", "read", [[sale_line_id]],
-                {"fields": ["order_id"]}
-            )
-            if sol and sol[0].get("order_id"):
-                so_id = sol[0]["order_id"][0]
-                so_records = _call(
-                    "sale.order", "read", [[so_id]],
-                    {"fields": [
-                        "name",                # S01501 — the SO number
-                        "partner_id",          # billing/consignee contact
-                        "partner_shipping_id", # shipping address (delivery point)
-                        "client_order_ref",    # customer's own PO number to VS
-                        "deal_reference",      # VSO-XXXX — the VS deal/reference number
-                    ]}
+        if line.get("sale_order_id") and isinstance(line["sale_order_id"], list):
+            so_id = line["sale_order_id"][0]
+            break
+
+    if so_id:
+        so_records = _call(
+            "sale.order", "read", [[so_id]],
+            {"fields": ["name", "partner_id", "partner_shipping_id", "deal_id"]}
+        )
+        if so_records:
+            so = so_records[0]
+            so_number = so.get("name", "")
+            # VSO number: deal_id is many2one → vs.deal, display_name = 'VSO001348'
+            deal_id_val  = so.get("deal_id")
+            vs_reference = deal_id_val[1] if deal_id_val else so_number
+
+            billing_partner_id  = (so.get("partner_id") or [None])[0]
+            shipping_partner_id = (so.get("partner_shipping_id") or [None])[0]
+
+            # ── Consignee = billing partner (company VS sold to) ────────
+            if billing_partner_id:
+                partners = _call(
+                    "res.partner", "read", [[billing_partner_id]],
+                    {"fields": ["name", "street", "street2",
+                                "city", "zip", "country_id",
+                                "is_company", "parent_id"]}
                 )
-                if so_records:
-                    so   = so_records[0]
-                    so_number    = so.get("name", "")
-                    customer_po  = so.get("client_order_ref") or ""
-                    vs_reference = so.get("deal_reference") or ""  # VSO-XXXX
-
-                    billing_partner_id  = (so.get("partner_id") or [None])[0]
-                    shipping_partner_id = (so.get("partner_shipping_id") or [None])[0]
-
-                    # ── Consignee = billing partner (company VS sold to) ────────
-                    if billing_partner_id:
-                        partners = _call(
-                            "res.partner", "read", [[billing_partner_id]],
+                if partners:
+                    p = partners[0]
+                    if not p.get("is_company") and p.get("parent_id"):
+                        parent_id = p["parent_id"][0]
+                        parent = _call(
+                            "res.partner", "read", [[parent_id]],
                             {"fields": ["name", "street", "street2",
-                                        "city", "zip", "country_id",
-                                        "is_company", "parent_id"]}
+                                        "city", "zip", "country_id"]}
                         )
-                        if partners:
-                            p = partners[0]
-                            # If this is an individual contact, prefer their parent company
-                            if not p.get("is_company") and p.get("parent_id"):
-                                parent_id = p["parent_id"][0]
-                                parent = _call(
-                                    "res.partner", "read", [[parent_id]],
-                                    {"fields": ["name", "street", "street2",
-                                                "city", "zip", "country_id"]}
-                                )
-                                if parent:
-                                    p = parent[0]
-                            buyer_name    = p.get("name", "")
-                            country_field = p.get("country_id")
-                            buyer_country = country_field[1] if country_field else ""
-                            parts = [
-                                p.get("street") or "",
-                                p.get("street2") or "",
-                                " ".join(filter(None, [p.get("zip", ""), p.get("city", "")])),
-                                buyer_country,
-                            ]
-                            buyer_address = ", ".join(x for x in parts if x)
+                        if parent:
+                            p = parent[0]
+                    buyer_name    = p.get("name", "")
+                    country_field = p.get("country_id")
+                    buyer_country = country_field[1] if country_field else ""
+                    parts = [
+                        p.get("street") or "",
+                        p.get("street2") or "",
+                        " ".join(filter(None, [p.get("zip", ""), p.get("city", "")])),
+                        buyer_country,
+                    ]
+                    buyer_address = ", ".join(x for x in parts if x)
 
-                    # ── Destination = shipping address (if different from billing) ──
-                    if shipping_partner_id and shipping_partner_id != billing_partner_id:
-                        partners = _call(
-                            "res.partner", "read", [[shipping_partner_id]],
-                            {"fields": ["name", "street", "street2",
-                                        "city", "zip", "country_id", "parent_id"]}
-                        )
-                        if partners:
-                            p = partners[0]
-                            country_field = p.get("country_id")
-                            dest_country  = country_field[1] if country_field else ""
-                            parts = [
-                                p.get("street") or "",
-                                p.get("street2") or "",
-                                " ".join(filter(None, [p.get("zip", ""), p.get("city", "")])),
-                                dest_country,
-                            ]
-                            dest_name    = p.get("name", "")
-                            dest_address = ", ".join(x for x in parts if x)
-                    else:
-                        # Shipping same as billing — destination = consignee
-                        dest_name    = buyer_name
-                        dest_address = buyer_address
-                break  # Found SO — stop
+            # ── Destination = shipping address (if different from billing) ──
+            if shipping_partner_id and shipping_partner_id != billing_partner_id:
+                partners = _call(
+                    "res.partner", "read", [[shipping_partner_id]],
+                    {"fields": ["name", "street", "street2",
+                                "city", "zip", "country_id", "parent_id"]}
+                )
+                if partners:
+                    p = partners[0]
+                    country_field = p.get("country_id")
+                    dest_country  = country_field[1] if country_field else ""
+                    parts = [
+                        p.get("street") or "",
+                        p.get("street2") or "",
+                        " ".join(filter(None, [p.get("zip", ""), p.get("city", "")])),
+                        dest_country,
+                    ]
+                    dest_name    = p.get("name", "")
+                    dest_address = ", ".join(x for x in parts if x)
+            else:
+                dest_name    = buyer_name
+                dest_address = buyer_address
+
+    print(f"[Odoo] SO={so_number} | VSO={vs_reference} | Buyer={buyer_name}")
 
     # 5. Delivery note: find done stock.picking records that contain our VSI lines
     if so_id and sale_line_ids:
@@ -466,8 +459,8 @@ def get_neutralisation_data(vs_po_number: str) -> dict:
     return {
         "po_number":      vs_po_number,   # VS PO number this data was fetched for
         "so_number":      so_number,
-        "vs_reference":   vs_reference,   # = so_number (the VS SO ref)
-        "customer_po":    customer_po,    # = client_order_ref (buyer's PO to VS)
+        "vs_reference":   vs_reference,   # VSO number from sale.order.deal_id, fallback to SO
+        "customer_po":    customer_po,
         "buyer_name":     buyer_name,     # consignee company name
         "buyer_country":  buyer_country,
         "buyer_address":  buyer_address,  # consignee address
