@@ -102,14 +102,16 @@ STRINGS = {
         "coil":         "coil",
         "coils":        "coils",
         "page":         "Page {i} of {n}",
-        "decl": ("We hereby certify that the material described above has been supplied in "
-                 "accordance with the requirements of the order and complies with the stated "
-                 "specification. All test results stated herein are based on authenticated "
-                 "records from the original manufacturer's inspection data."),
+        "cert_open": "This inspection certificate has been issued in accordance with EN 10204 Type 3.1.",
+        "cert_close": ("All test results stated herein are based on authenticated "
+                       "records from the original manufacturer's inspection data."),
         "iso":  ("The Quality Management System applied to the manufacturing of the goods "
                  "described above is certified to meet the requirements of ISO 9001 and "
                  "IATF 16949."),
         "valid": "This certificate is valid without signature.",
+        "chem_rowlbl_heat": "Heat / Cast",
+        "chem_min": "Specified min.",
+        "chem_max_row": "Specified max.",
         "dims_note": ("All positions share the same nominal cross-section "
                       "(thickness × width) as stated in Product Details."),
         "legend": ("Specimen condition (Cond.): F = Non-Aged, V = Aged, N = Normalised  |  "
@@ -140,14 +142,15 @@ STRINGS = {
         "coil":         "Coil",
         "coils":        "Coils",
         "page":         "Seite {i} von {n}",
-        "decl": ("Hiermit bescheinigen wir, dass das oben beschriebene Material gemäß den "
-                 "Anforderungen der Bestellung geliefert wurde und der angegebenen "
-                 "Spezifikation entspricht. Alle hier aufgeführten Prüfergebnisse beruhen "
-                 "auf beglaubigten Aufzeichnungen der Prüfdaten des ursprünglichen "
-                 "Herstellers."),
+        "cert_open": "Diese Prüfbescheinigung wurde gemäß EN 10204 Typ 3.1 ausgestellt.",
+        "cert_close": ("Alle hier aufgeführten Prüfergebnisse beruhen auf beglaubigten "
+                       "Aufzeichnungen der Prüfdaten des ursprünglichen Herstellers."),
         "iso":  ("Das bei der Herstellung der oben beschriebenen Erzeugnisse angewandte "
                  "Qualitätsmanagementsystem ist nach ISO 9001 und IATF 16949 zertifiziert."),
         "valid": "Dieses Zeugnis ist ohne Unterschrift gültig.",
+        "chem_rowlbl_heat": "Schmelze / Charge",
+        "chem_min": "Grenzwert min.",
+        "chem_max_row": "Grenzwert max.",
         "dims_note": ("Alle Positionen haben den gleichen Nennquerschnitt "
                       "(Dicke × Breite) wie unter Produktangaben angegeben."),
         "legend": ("Probenzustand (Cond.): F = nicht gealtert, V = gealtert, N = normalisiert  |  "
@@ -188,6 +191,10 @@ def _register_fonts(font_dir: str | None) -> None:
 
 # ── Styles (built after font registration) ───────────────────────────────────
 S: dict = {}
+
+# Render-time locale (set per call in generate_certificate)
+_LANG = "en"
+_NUMFMT = ""
 
 def _build_styles() -> None:
     def _s(name, **kw):
@@ -314,10 +321,14 @@ def _to_float(v) -> float:
         return 0.0
 
 def _fmt_int_kg(v) -> str:
-    """Group thousands for weight totals only; per-row values stay verbatim."""
+    """Group thousands for weight totals only; per-row values stay verbatim.
+    Locale-aware: English '2,170' → German '2.170'."""
     try:
         f = _to_float(v)
-        return f"{f:,.0f}" if f == int(f) else f"{f:,.1f}"
+        s = f"{f:,.0f}" if f == int(f) else f"{f:,.1f}"
+        if _LANG == "de":  # swap , and . for German number format
+            s = s.replace(",", "\x00").replace(".", ",").replace("\x00", ".")
+        return s
     except Exception:
         return _blank(v)
 
@@ -336,6 +347,90 @@ def _p(text, sty=None, esc=True):
     return Paragraph(_esc(text) if esc else str(text), sty or S["TD_L"])
 
 _SCALE_RE = re.compile(r"[x×]\s*10\s*(?:\^|-|⁻)?\s*(-?\d+)", re.IGNORECASE)
+
+# ── Identifier join + VSI resolution ─────────────────────────────────────────
+_ID_STRIP_RE = re.compile(r"[\s\-_./]+")
+
+def _norm_id(v) -> str:
+    if v is None or v is False:
+        return ""
+    s = _ID_STRIP_RE.sub("", str(v)).upper()
+    return (s.lstrip("0") or ("0" if s else ""))
+
+def _resolve_vsi(coil: dict, vs_articles: dict) -> str:
+    """Prefer the authoritative match set by the API join; else look the coil's
+    own identifiers up in the (normalised-keyed) map; else single-article
+    wildcard; else en-dash. Never silently borrows another row's VSI."""
+    mv = str(coil.get("_matched_vsi") or "").strip()
+    if mv and mv != "–":
+        return mv
+    if isinstance(vs_articles, dict):
+        for f in ("coil_no", "cast_no", "pack_no", "serial"):
+            raw = str(coil.get(f) or "").strip()
+            if raw and raw in vs_articles:
+                return vs_articles[raw]
+            k = _norm_id(coil.get(f))
+            if k and k in vs_articles:
+                return vs_articles[k]
+        if vs_articles.get("*"):
+            return vs_articles["*"]
+    return "–"
+
+# ── Number localisation (comma for de, dot for en) ───────────────────────────
+def _localise_num(v, number_format: str, language: str) -> str:
+    """Re-emit a verbatim numeric string in the target locale WITHOUT changing
+    any significant digit or trailing zero. Non-numeric text passes through."""
+    if v is None:
+        return "–"
+    s = str(v).strip()
+    if not s:
+        return "–"
+    # split a possible leading symbol (<, ≤, >, ≥) and trailing text
+    m = re.match(r"^\s*([<≤>≥]?\s*)(-?[\d.,]+)(.*)$", s)
+    if not m:
+        return s
+    pre, num, post = m.group(1), m.group(2), m.group(3)
+    # interpret the number using the SOURCE convention, decimal part only
+    if number_format == "comma":
+        intpart, _, dec = num.replace(".", "").partition(",")
+    elif number_format == "dot":
+        intpart, _, dec = num.replace(",", "").partition(".")
+    else:  # unknown: infer from the last separator present
+        if "," in num and "." in num:
+            last = max(num.rfind(","), num.rfind("."))
+            dec = num[last + 1:]
+            intpart = re.sub(r"[.,]", "", num[:last])
+        elif "," in num:
+            intpart, _, dec = num.partition(",")
+        else:
+            intpart, _, dec = num.partition(".")
+    sep = "," if language == "de" else "."
+    out = intpart + (sep + dec if dec != "" else "")
+    return (pre.replace(" ", "") + out + post)
+
+# ── Certificate-type display normaliser (never render raw supplier German) ───
+def _norm_cert_type(v) -> str:
+    s = str(v or "")
+    if "2.2" in s:
+        return "EN 10204 – Type 2.2"
+    if "3.2" in s:
+        return "EN 10204 – Type 3.2"
+    if "3.1" in s:
+        return "EN 10204 – Type 3.1"
+    return s.strip()
+
+# ── Neutralisation backstop: drop any identity that slipped past extraction ──
+_ADMIN_DENY_RE = re.compile(
+    r"(kunden[\-\s]?nummer|customer\s*(no|number)|abnahmebeauftragt|inspector|"
+    r"lieferschein|delivery\s*note|dispatch|auftrags?[\-\s]?nr|order\s*no|"
+    r"bestell|material[\-\s]?nummer|artikel[\-\s]?nr|besteller|"
+    r"ust[\-\s]?id|vat|steuer|iban|swift|bic|hrb|hrg|registergericht|"
+    r"gesch[aä]ftsf[uü]hrer|managing\s*director|bank)",
+    re.IGNORECASE,
+)
+
+def _is_admin_leak(text: str) -> bool:
+    return bool(_ADMIN_DENY_RE.search(str(text or "")))
 
 def _unit_markup(header: str, elem: str) -> str:
     """'C x10-3 %' → 'C<br/>×10<super>-3</super> %' (escaped, safe)."""
@@ -476,7 +571,7 @@ def _positions_table(L, coils, vs_articles, show_net, show_pack, show_serial,
         if key == "net":    return _p(_blank(c.get("weight_kg")), S["TD_R"])
         if key == "gross":  return _p(_blank(c.get("gross_weight_kg")), S["TD_RB"])
         if key == "vsa":
-            va = vs_articles.get(str(c.get("coil_no") or "")) or vs_articles.get("*") or "–"
+            va = _resolve_vsi(c, vs_articles)
             return _p(va, S["TD_LB"])
         if isinstance(key, tuple):  # extra column
             return _p(_blank((c.get("extra") or {}).get(key[1])), S["TD_L"])
@@ -524,26 +619,68 @@ def _positions_table(L, coils, vs_articles, show_net, show_pack, show_serial,
 
 
 # ── Section: Chemical Composition ─────────────────────────────────────────────
-def _chem_table(coils, chem_headers):
-    # one row per unique heat, preserving source order
+def _coil_chem(c: dict):
+    """Return (measured{elem:str}, limits{elem:{'min','max'}}) for one coil,
+    tolerant of both the new shape (chemicals=str, chemical_limits=dict) and the
+    old nested shape (chemicals[elem]={'ist','min','max'})."""
+    measured, limits = {}, {}
+    chem = c.get("chemicals") or {}
+    for e, v in chem.items():
+        if isinstance(v, dict):  # legacy nested — split it
+            meas = v.get("ist") or v.get("meas") or v.get("measured") or v.get("value")
+            if _has(meas):
+                measured[e] = meas
+            lo, hi = v.get("min"), v.get("max")
+            if _has(lo) or _has(hi):
+                limits[e] = {"min": lo or "", "max": hi or ""}
+        elif _has(v):
+            measured[e] = v
+    for e, lim in (c.get("chemical_limits") or {}).items():
+        if isinstance(lim, dict) and (_has(lim.get("min")) or _has(lim.get("max"))):
+            limits.setdefault(e, {"min": lim.get("min") or "", "max": lim.get("max") or ""})
+    return measured, limits
+
+
+def _chem_table(coils, chem_headers, L, number_format="", language="en"):
+    # one measured row per unique heat; plus merged spec min/max rows if present
     seen: dict = {}
+    limits_by_heat: dict = {}
     for c in coils:
         heat = str(c.get("cast_no") or c.get("coil_no") or "")
-        if heat and heat not in seen and _has(c.get("chemicals")):
-            seen[heat] = c.get("chemicals") or {}
-    if not seen:
+        meas, lim = _coil_chem(c)
+        if heat and heat not in seen and (meas or lim):
+            seen[heat] = meas
+            limits_by_heat[heat] = lim
+    if not seen and not any(limits_by_heat.values()):
         return None, []
 
-    # dynamic element order: chem_headers order first, then first-seen order
+    # dynamic element order: header order first, then first-seen measured, then limits
     order: list = []
+    def _add(e):
+        if e not in order:
+            order.append(e)
     if chem_headers:
-        order += [e for e in chem_headers if any(_has(ch.get(e)) for ch in seen.values())]
-    for ch in seen.values():
-        for e in ch:
-            if e not in order and _has(ch.get(e)):
-                order.append(e)
+        for e in chem_headers:
+            if any(_has(m.get(e)) for m in seen.values()) or \
+               any(e in lm for lm in limits_by_heat.values()):
+                _add(e)
+    for m in seen.values():
+        for e in m:
+            _add(e)
+    for lm in limits_by_heat.values():
+        for e in lm:
+            _add(e)
     if not order:
         return None, []
+
+    # merged spec limits across heats (first non-empty per element)
+    merged_min, merged_max = {}, {}
+    for lm in limits_by_heat.values():
+        for e, b in lm.items():
+            if e not in merged_min and _has(b.get("min")):
+                merged_min[e] = b["min"]
+            if e not in merged_max and _has(b.get("max")):
+                merged_max[e] = b["max"]
 
     heads = []
     for e in order:
@@ -551,14 +688,23 @@ def _chem_table(coils, chem_headers):
         if hdr:
             heads.append(_p(_unit_markup(str(hdr), e), S["TH_R"], esc=False))
         else:
-            heads.append(_p(f"<b>{_esc(e)}</b>", S["TH_R"], esc=False))
+            heads.append(_p(f"<b>{_esc(e)}</b><br/><font size=6.5>%</font>", S["TH_R"], esc=False))
 
-    cw_heat = CONTENT_W * max(0.09, min(0.14, 1.6 / (len(order) + 2)))
+    cw_heat = CONTENT_W * max(0.10, min(0.16, 1.9 / (len(order) + 2)))
     cw_elem = (CONTENT_W - cw_heat) / len(order)
-    rows = [[_p("Heat / Cast", S["TH"])] + heads]
+
+    def _cell(v):
+        return _p(_localise_num(v, number_format, language) if _has(v) else "–", S["TD_R"])
+
+    rows = [[_p(L.get("chem_rowlbl_heat", "Heat / Cast"), S["TH"])] + heads]
     for heat, chems in seen.items():
-        rows.append([_p(heat, S["TD_LB"])] +
-                    [_p(_blank(chems.get(e)), S["TD_R"]) for e in order])
+        rows.append([_p(heat, S["TD_LB"])] + [_cell(chems.get(e)) for e in order])
+    if merged_min:
+        rows.append([_p(L.get("chem_min", "Specified min."), S["TD_L"])]
+                    + [_cell(merged_min.get(e)) for e in order])
+    if merged_max:
+        rows.append([_p(L.get("chem_max_row", "Specified max."), S["TD_L"])]
+                    + [_cell(merged_max.get(e)) for e in order])
 
     t = Table(rows, colWidths=[cw_heat] + [cw_elem] * len(order), repeatRows=1)
     t.setStyle(TableStyle([
@@ -587,10 +733,13 @@ def _mech_rows(coils):
                     out.append((c, e))
     return out
 
-def _mech_table(L, coils, remarks):
+def _mech_table(L, coils, remarks, number_format="", language="en"):
     pairs = _mech_rows(coils)
     if not pairs:
         return None, None
+
+    def loc(v):
+        return _localise_num(v, number_format, language) if _has(v) else "–"
 
     def yl(m):  # yield label verbatim from source
         return str(m.get("yield_label") or "").strip()
@@ -603,29 +752,37 @@ def _mech_table(L, coils, remarks):
     have_dir  = any(_has(m.get("dir"))  for _, m in pairs)
     have_cond = any(_has(m.get("cond")) for _, m in pairs)
     have_bend = any(_has(m.get("bend")) for _, m in pairs)
+    have_r    = any(_has(m.get("r_value")) for _, m in pairs)
+    have_n    = any(_has(m.get("n_value")) for _, m in pairs)
     extra_keys: list = []
     for _, m in pairs:
         for k in (m.get("other") or {}):
             if k not in extra_keys and _has((m.get("other") or {}).get(k)):
                 extra_keys.append(k)
 
-    plan = [("coil", "Coil / Pack No.", 1.9, S["TH"],   S["TD_LB"])]
+    UNIT = "(N/mm<super>2</super>)"
+    plan = [("coil", "Coil / Pack No.", 1.9, S["TH"], S["TD_LB"], True)]
     if have_cond:
-        plan.append(("cond", "Cond.", 0.7, S["TH_C"], S["TD_C"]))
+        plan.append(("cond", "Cond.", 0.7, S["TH_C"], S["TD_C"], True))
     if have_dir:
-        plan.append(("dir", "Dir.", 0.7, S["TH_C"], S["TD_C"]))
-    plan.append(("yield", f"{yield_hdr} (N/mm²)", 1.5, S["TH_R"], S["TD_RB"]))
-    plan.append(("rm",    "Rm (N/mm²)",           1.3, S["TH_R"], S["TD_RB"]))
-    plan.append(("a",     f"{a_hdr} (%)",         1.0, S["TH_R"], S["TD_R"]))
+        plan.append(("dir", "Dir.", 0.7, S["TH_C"], S["TD_C"], True))
+    plan.append(("yield", f"{yield_hdr} {UNIT}", 1.5, S["TH_R"], S["TD_RB"], False))
+    plan.append(("rm",    f"Rm {UNIT}",          1.3, S["TH_R"], S["TD_RB"], False))
+    plan.append(("a",     f"{a_hdr} (%)",        1.0, S["TH_R"], S["TD_R"],  True))
+    if have_r:
+        plan.append(("r", "r-value", 1.0, S["TH_R"], S["TD_R"], True))
+    if have_n:
+        plan.append(("n", "n-value", 1.0, S["TH_R"], S["TD_R"], True))
     if have_bend:
-        plan.append(("bend", "Bend test", 1.0, S["TH_C"], S["TD_C"]))
+        plan.append(("bend", "Bend test", 1.0, S["TH_C"], S["TD_C"], True))
     for k in extra_keys:
-        plan.append((("x", k), k, 1.1, S["TH_R"], S["TD_R"]))
+        plan.append((("x", k), k, 1.1, S["TH_R"], S["TD_R"], True))
 
     tw = sum(p[2] for p in plan)
     cw = [CONTENT_W * p[2] / tw for p in plan]
 
-    rows = [[_p(p[1], p[3]) for p in plan]]
+    # header row (superscript markup where needed → esc=False)
+    rows = [[_p(p[1], p[3], esc=p[5]) for p in plan]]
     for c, m in pairs:
         r = []
         for p in plan:
@@ -637,15 +794,19 @@ def _mech_table(L, coils, remarks):
             elif k == "dir":
                 r.append(_p(_blank(m.get("dir")), S["TD_C"]))
             elif k == "yield":
-                r.append(_p(_blank(m.get("yield_value") or m.get("rp02")), S["TD_RB"]))
+                r.append(_p(loc(m.get("yield_value") or m.get("rp02")), S["TD_RB"]))
             elif k == "rm":
-                r.append(_p(_blank(m.get("rm")), S["TD_RB"]))
+                r.append(_p(loc(m.get("rm")), S["TD_RB"]))
             elif k == "a":
-                r.append(_p(_blank(m.get("a_pct")), S["TD_R"]))
+                r.append(_p(loc(m.get("a_pct")), S["TD_R"]))
+            elif k == "r":
+                r.append(_p(loc(m.get("r_value")), S["TD_R"]))
+            elif k == "n":
+                r.append(_p(loc(m.get("n_value")), S["TD_R"]))
             elif k == "bend":
                 r.append(_p(_blank(m.get("bend")), S["TD_C"]))
             elif isinstance(k, tuple):
-                r.append(_p(_blank((m.get("other") or {}).get(k[1])), S["TD_R"]))
+                r.append(_p(loc((m.get("other") or {}).get(k[1])), S["TD_R"]))
         rows.append(r)
 
     t = Table(rows, colWidths=cw, repeatRows=1)
@@ -659,13 +820,45 @@ def _mech_table(L, coils, remarks):
         ("VALIGN",        (0, 0), (-1, -1), "BOTTOM"),
     ]))
 
-    # mandatory decoder legend; append specimen dimensions from remarks if present
-    legend = L["legend"]
-    for r in remarks or []:
-        if re.search(r"L\s*[C0]\s*/\s*L0\s*/\s*B0|LC/L0/B0", str(r), re.IGNORECASE):
-            legend += f"  |  {str(r).strip()}"
+    # ── Dynamic decoder legend: only codes actually present ──
+    dir_map = {"L": "Longitudinal", "T": "Transverse", "Q": "Transverse (quer)",
+               "QUER": "Transverse (quer)", "S": "45°", "D": "Transverse (90°)",
+               "0°": "Longitudinal (0°)", "90°": "Transverse (90°)", "45°": "45°"}
+    cond_map = {"F": "Non-Aged", "V": "Aged", "N": "Normalised"}
+    dirs_present  = {str(m.get("dir")).strip().upper()  for _, m in pairs if _has(m.get("dir"))}
+    conds_present = {str(m.get("cond")).strip().upper() for _, m in pairs if _has(m.get("cond"))}
+    parts = []
+    if conds_present:
+        cs = [f"{k} = {cond_map.get(k, k)}" for k in sorted(conds_present)]
+        parts.append("Condition (Cond.): " + ", ".join(cs))
+    if dirs_present:
+        ds = [f"{k} = {dir_map.get(k, k.title())}" for k in sorted(dirs_present)]
+        parts.append("Direction (Dir.): " + ", ".join(ds))
+
+    # ── Specification limits note (merged, so we don't repeat per coil) ──
+    lim_labels = {
+        "yield_min": f"{yield_hdr} min", "yield_max": f"{yield_hdr} max",
+        "rm_min": "Rm min", "rm_max": "Rm max",
+        "a_min": f"{a_hdr} min", "a_max": f"{a_hdr} max",
+        "r_min": "r min", "r_max": "r max", "n_min": "n min", "n_max": "n max",
+    }
+    merged_lim: dict = {}
+    for _, m in pairs:
+        for k, v in (m.get("limits") or {}).items():
+            if _has(v) and k not in merged_lim:
+                merged_lim[k] = v
+    if merged_lim:
+        segs = [f"{lim_labels.get(k, k)} {loc(v)}" for k, v in merged_lim.items()]
+        parts.append("Specified limits — " + "; ".join(segs))
+
+    # specimen dimensions from remarks, if present
+    for rr in remarks or []:
+        if re.search(r"L\s*[C0]\s*/\s*L0\s*/\s*B0|LC/L0/B0", str(rr), re.IGNORECASE):
+            parts.append(str(rr).strip())
             break
-    return t, _p(legend, S["NOTE"])
+
+    legend_txt = "  |  ".join(parts) if parts else ""
+    return t, (_p(legend_txt, S["NOTE"]) if legend_txt else Spacer(1, 0.1))
 
 
 # ── Section: Coating & Surface Tests ──────────────────────────────────────────
@@ -752,9 +945,10 @@ def _remarks_flowables(remarks):
     return out
 
 def _certification_flowables(L, include_iso):
-    out = [_p(L["decl"], S["DECL"])]
+    out = [_p(L["cert_open"], S["DECL"])]
     if include_iso:
         out += [Spacer(1, 2 * mm), _p(L["iso"], S["DECL"])]
+    out += [Spacer(1, 2 * mm), _p(L["cert_close"], S["DECL"])]
     out.append(Spacer(1, 4 * mm))
     box = Table([[_p(L["valid"], S["VALID"])]], colWidths=[CONTENT_W * 0.45])
     box.setStyle(TableStyle([
@@ -799,18 +993,25 @@ def generate_certificate(
     L = STRINGS.get(language, STRINGS["en"])
     _NumberedCanvas.page_tpl = L["page"]
 
+    global _LANG, _NUMFMT
+    _LANG = language
+    _NUMFMT = str(parsed_cert.get("number_format") or "")
+
     coils       = parsed_cert.get("coils") or []
     remarks_raw = parsed_cert.get("remarks")
     remarks     = ([str(r) for r in remarks_raw if _has(r)]
                    if isinstance(remarks_raw, list)
                    else ([str(remarks_raw)] if _has(remarks_raw) else []))
+    # Neutralisation backstop: drop any remark that reads as administrative /
+    # identity data (should already be in source_admin, but never leak it here).
+    remarks = [r for r in remarks if not _is_admin_leak(r)]
     vs_articles = dict(odoo_data.get("vs_articles") or {})
     if not vs_articles and _has(odoo_data.get("vs_article")):
         vs_articles = {"*": str(odoo_data["vs_article"])}
 
     so_number    = _blank(odoo_data.get("so_number"), "")
     dest_country = _blank(odoo_data.get("buyer_country"), "–")
-    cert_type    = _blank(parsed_cert.get("cert_type") or parsed_cert.get("insp_type"))
+    cert_type    = _norm_cert_type(parsed_cert.get("cert_type") or parsed_cert.get("insp_type"))
     issue_date   = _fmt_date(parsed_cert.get("cert_date"))
     standard     = _blank(parsed_cert.get("standard"))
     if not so_number:
@@ -879,7 +1080,8 @@ def generate_certificate(
         extra_cols: list = []
         for c in coils:
             for k, v in (c.get("extra") or {}).items():
-                if k not in extra_cols and _has(v):
+                # backstop: never surface an administrative/identity column
+                if k not in extra_cols and _has(v) and not _is_admin_leak(k):
                     extra_cols.append(k)
         # per-row grade fallback: document-level grade if rows carry none
         for c in coils:
@@ -895,7 +1097,7 @@ def generate_certificate(
         story.append(Spacer(1, 6 * mm))
 
     chem_headers = parsed_cert.get("chem_headers") or {}
-    chem_t, chem_elems = _chem_table(coils, chem_headers)
+    chem_t, chem_elems = _chem_table(coils, chem_headers, L, _NUMFMT, _LANG)
     if chem_t:
         n += 1
         cvt = (parsed_cert.get("chem_value_type") or
@@ -909,7 +1111,7 @@ def generate_certificate(
                   _sec_hdr(n, L["s_chem"], unit_note), chem_t,
                   Spacer(1, 6 * mm)]
 
-    mech_t, legend_p = _mech_table(L, coils, remarks)
+    mech_t, legend_p = _mech_table(L, coils, remarks, _NUMFMT, _LANG)
     if mech_t:
         n += 1
         story += [CondPageBreak(45 * mm),

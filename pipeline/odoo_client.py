@@ -290,14 +290,33 @@ def get_neutralisation_data(vs_po_number: str) -> dict:
     product_detail: dict[int, dict] = {}
     if product_ids:
         try:
-            # Fetch standard product fields only — avoid custom x_ fields that may not exist
+            # 'description' lives on product.template but Odoo delegates it to
+            # product.product, so a direct read works. We keep it as an extra
+            # identifier source (humans sometimes type the heat/article here).
             rows = _call(
                 "product.product", "read",
                 [list(set(product_ids))],
-                {"fields": ["id", "name"]}
+                {"fields": ["id", "name", "description", "product_tmpl_id"]}
             )
             for r in rows:
                 product_detail[r["id"]] = r
+            # Template fallback: if the product-level description is empty,
+            # read it from the template so the join still has something to see.
+            tmpl_ids = [
+                r["product_tmpl_id"][0]
+                for r in rows
+                if not r.get("description") and isinstance(r.get("product_tmpl_id"), list)
+            ]
+            if tmpl_ids:
+                tmpls = _call(
+                    "product.template", "read",
+                    [list(set(tmpl_ids))],
+                    {"fields": ["id", "description"]}
+                )
+                tmpl_desc = {t["id"]: t.get("description") for t in tmpls}
+                for r in rows:
+                    if not r.get("description") and isinstance(r.get("product_tmpl_id"), list):
+                        r["description"] = tmpl_desc.get(r["product_tmpl_id"][0])
         except Exception as e:
             print(f"[Odoo] WARNING: Could not fetch product details: {e}")
 
@@ -325,6 +344,8 @@ def get_neutralisation_data(vs_po_number: str) -> dict:
             "vs_article":                l.get("vs_article") or "–",
             "aoo_fast_number":           l.get("aoo_fast_number"),
             "original_supplier_article": l.get("original_supplier_article"),
+            # Product description — extra identifier source for the per-coil join.
+            "description_field":         (prod.get("description") or "") if prod.get("description") not in (False, None) else "",
             "weight_t":                  qty,    # tonnes per item
             # Flag placeholder/cancelled lines — zero ordered qty should not auto-match
             "confidence":                "LOW_CONFIDENCE" if qty == 0 else "OK",

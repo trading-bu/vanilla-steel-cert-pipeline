@@ -216,36 +216,141 @@ def _decide_language(parsed: dict, odoo_data: dict) -> str:
 # vs_articles normalisation
 # ---------------------------------------------------------------------------
 
+_ID_STRIP_RE = re.compile(r"[\s\-_./]+")
+
+
+def _norm_id(v) -> str:
+    """Normalise an identifier for exact joining: drop separators, uppercase,
+    strip leading zeros. '0516538085' and '516 538 085' → '516538085'.
+    Returns '' for empty/placeholder-ish blanks."""
+    if v is None or v is False:
+        return ""
+    s = _ID_STRIP_RE.sub("", str(v)).upper()
+    s = s.lstrip("0") or ("0" if s else "")
+    return s
+
+
+def _line_id_keys(art: dict) -> set:
+    """All normalised identifier keys a PO line can be joined on."""
+    keys = set()
+    for f in ("original_supplier_article", "aoo_fast_number", "description_field"):
+        k = _norm_id(art.get(f))
+        if k:
+            keys.add(k)
+    return keys
+
+
 def _normalise_vs_articles(odoo_data: dict) -> dict:
     """
-    pdf_generator v3 expects vs_articles as {coil_no: "VSI-XXXX"}.
-    odoo_client returns a list of dicts with original_supplier_article + vs_article.
-    Convert list → dict keyed by original_supplier_article (== cert coil_no).
-    Falls back to {"*": first_vs_article} when only one article exists.
+    pdf_generator v3 expects vs_articles as {coil_key: "VSI-XXXX"}.
+    odoo_client returns a list of dicts. We index each VSI under EVERY
+    identifier a cert coil might carry — normalised (leading zeros / separators
+    stripped) — so the join is robust to formatting:
+      · original_supplier_article   · aoo_fast_number   · description_field
+    plus the raw original_supplier_article (back-compat) and a "*" wildcard
+    ONLY when there is exactly one article (single-coil certs).
+
+    A normalised key that maps to more than one *different* VSI is dropped
+    (ambiguous — e.g. a hand-typed placeholder like '12345'), so it can never
+    force a wrong match; those coils fall through to weight/dim scoring + flag.
     """
     raw = odoo_data.get("vs_articles") or []
     if isinstance(raw, dict):
-        return odoo_data  # already correct format
+        return odoo_data  # already in map form
     if not isinstance(raw, list) or not raw:
         return odoo_data
 
-    art_map = {}
-    for art in raw:
-        osa = (art.get("original_supplier_article") or "").strip()
-        va  = (art.get("vs_article") or "").strip()
-        if va:
-            if osa:
-                art_map[osa] = va
-            else:
-                art_map.setdefault("*", va)
+    art_map: dict = {}
+    collisions: set = set()
 
-    # If we couldn't key by coil, fall back to wildcard
-    if not art_map and raw:
-        va = (raw[0].get("vs_article") or "").strip()
-        if va:
-            art_map = {"*": va}
+    def _put(key, va):
+        if not key or not va:
+            return
+        if key in art_map and art_map[key] != va:
+            collisions.add(key)          # ambiguous → mark for removal
+        else:
+            art_map[key] = va
+
+    for art in raw:
+        va = (art.get("vs_article") or "").strip()
+        if not va or va == "–":
+            continue
+        # raw article key (back-compat with previous behaviour)
+        osa = (art.get("original_supplier_article") or "").strip()
+        if osa:
+            _put(osa, va)
+        # normalised keys across all three identifier fields
+        for key in _line_id_keys(art):
+            _put(key, va)
+
+    for k in collisions:
+        art_map.pop(k, None)             # never let an ambiguous key decide
+
+    # Single-article fallback: one coil, one VSI → wildcard
+    distinct = {(a.get("vs_article") or "").strip()
+                for a in raw if (a.get("vs_article") or "").strip() not in ("", "–")}
+    if len(distinct) == 1:
+        art_map.setdefault("*", next(iter(distinct)))
 
     return {**odoo_data, "vs_articles": art_map}
+
+
+def _coil_id_candidates(coil: dict) -> set:
+    """Normalised identifiers a cert coil can be joined on."""
+    keys = set()
+    for f in ("cast_no", "coil_no", "pack_no", "original_supplier_article", "serial"):
+        k = _norm_id(coil.get(f))
+        if k:
+            keys.add(k)
+    return keys
+
+
+def _resolve_line_items(parsed: dict, odoo_raw: dict):
+    """
+    Per-coil identifier join (exact, normalised) against the Odoo PO lines.
+    Additive: runs BEFORE the existing weight/dimension scorer is relied on.
+      · Backfills each coil's grade from ITS matched line (not the first line).
+      · Returns the list of coils that found no unique identifier match, so the
+        caller can flag them (they fall through to existing scoring downstream).
+    Never deletes or overrides data the cert already provides.
+    """
+    lines = odoo_raw.get("vs_articles") or []
+    if not isinstance(lines, list):
+        return parsed, []
+
+    # Build normalised-key → line index, dropping ambiguous keys.
+    idx: dict = {}
+    collide: set = set()
+    for ln in lines:
+        for k in _line_id_keys(ln):
+            if k in idx and idx[k] is not ln:
+                collide.add(k)
+            else:
+                idx[k] = ln
+    for k in collide:
+        idx.pop(k, None)
+
+    coils = parsed.get("coils") or []
+    unmatched = []
+    for c in coils:
+        hit = None
+        for cand in _coil_id_candidates(c):
+            if cand in idx:
+                hit = idx[cand]
+                break
+        if hit:
+            c["_matched_vsi"] = (hit.get("vs_article") or "").strip()
+            # Backfill grade only when the cert itself gives none.
+            if not _has(c.get("grade")) and _has(hit.get("grade")):
+                c["grade"] = str(hit["grade"]).strip()
+        else:
+            unmatched.append(c)
+
+    return parsed, unmatched
+
+
+def _has(v) -> bool:
+    return not (v is None or v is False or (isinstance(v, str) and not v.strip()))
 
 
 # ---------------------------------------------------------------------------
@@ -450,19 +555,38 @@ async def generate(request: Request):
                    "Send this cert to /pending-cert or supply a valid VS PO number.",
         )
 
-    # Backfill grade from Odoo when the supplier cert states none (e.g. EMW
-    # certs identify material only by an internal Materialnummer, blank "Güte").
+    # Per-coil identifier join (exact, normalised) — backfills each coil's
+    # grade from ITS matched Odoo line and tells us which coils didn't match.
+    parsed, unmatched = _resolve_line_items(parsed, odoo_data)
+
+    # Backfill a document-level grade from Odoo ONLY when the cert states none.
+    # Prefer a matched line's grade; fall back to the PO's single line if the PO
+    # has exactly one line (never blindly grab the first of many — that was the
+    # HX460LAD-instead-of-DC03 bug).
     if not parsed.get("grade") and not parsed.get("grade_full") and not parsed.get("material_type"):
-        odoo_grade = _odoo_grade(odoo_data)
-        if odoo_grade:
-            parsed["grade"] = odoo_grade
-            parsed.setdefault("grade_full", odoo_grade)
-            print("[grade] Backfilled from Odoo vs_articles: %s" % odoo_grade)
+        odoo_lines = odoo_data.get("vs_articles") or []
+        grades = [str(a.get("grade") or "").strip() for a in odoo_lines if str(a.get("grade") or "").strip()]
+        matched_grade = next((str(c.get("grade")).strip() for c in (parsed.get("coils") or [])
+                              if _has(c.get("grade"))), "")
+        if matched_grade:
+            parsed["grade"] = matched_grade
+            parsed.setdefault("grade_full", matched_grade)
+            print("[grade] Backfilled from matched line: %s" % matched_grade)
+        elif len(odoo_lines) == 1 and grades:
+            parsed["grade"] = grades[0]
+            parsed.setdefault("grade_full", grades[0])
+            print("[grade] Backfilled from single PO line: %s" % grades[0])
 
     if not parsed.get("grade") and not parsed.get("material_type"):
-        # Neither the cert nor Odoo has a grade — proceed anyway and leave the
-        # grade blank in the output PDF (per requirement).
-        print("[grade] No grade on cert or in Odoo; leaving blank in output.")
+        # Neither the cert nor a matched Odoo line has a grade — leave blank.
+        print("[grade] No grade on cert or matched line; leaving blank in output.")
+
+    if unmatched:
+        # Additive signal only — surfaced in the response headers so Make can
+        # route low-confidence coils to the existing Slack review path.
+        print("[match] %d coil(s) had no unique identifier match; "
+              "VS Article may fall back to weight/dim scoring or blank+flag."
+              % len(unmatched))
 
     language = _decide_language(parsed, odoo_data)
 
