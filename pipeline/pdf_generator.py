@@ -161,12 +161,19 @@ def _fmt(v, dec=4):
         return str(v)
 
 def _fmtw(v):
-    if v is None:
+    if v is None or (isinstance(v, str) and not v.strip()):
         return "–"
     try:
         return f"{int(float(v)):,}"
     except (ValueError, TypeError):
         return str(v)
+
+def _to_float(v) -> float:
+    """Safe float conversion for values that may be strings or None."""
+    try:
+        return float(v) if v else 0.0
+    except (TypeError, ValueError):
+        return 0.0
 
 def _fmt_date(d):
     if not d:
@@ -311,8 +318,6 @@ def _items_table(coils, total_weight, has_net=True, has_gross=True):
 
     rows = [header]
     for i, c in enumerate(coils, 1):
-        net_kg   = c.get("weight_kg")
-        gross_kg = c.get("gross_weight_kg")
         rows.append([
             _p(str(i),                                               S_TD_L),
             _p(_blank(c.get("coil_no")),                             S_TD_LB),
@@ -320,8 +325,8 @@ def _items_table(coils, total_weight, has_net=True, has_gross=True):
             _p(_blank(c.get("serial_no") or c.get("serial", "")),    S_TD_C),
             _p(_blank(c.get("thickness_mm")),                        S_TD_R),
             _p(_blank(c.get("width_mm")),                            S_TD_R),
-            _p(_fmtw(net_kg)   if net_kg   is not None else "–",     S_TD_R),
-            _p(_fmtw(gross_kg) if gross_kg is not None else "–",     S_TD_MUT),
+            _p(_fmtw(c.get("weight_kg")),                            S_TD_R),
+            _p(_fmtw(c.get("gross_weight_kg")),                      S_TD_MUT),
             _p(str(c.get("qty") or 1),                               S_TD_R),
         ])
 
@@ -385,26 +390,32 @@ def _mech_table(coils):
 
     rows = [header]
     for c in coils:
-        m = c.get("mechanical") or {}
-        rp02 = m.get("rp02")
+        mech_raw = c.get("mechanical")
+        # New schema: mechanical is an array; old schema: a dict
+        if isinstance(mech_raw, list):
+            m = mech_raw[0] if mech_raw else {}
+        else:
+            m = mech_raw or {}
+        # yield_value (new) or rp02 (old)
+        rp02 = m.get("yield_value") or m.get("rp02")
         rm   = m.get("rm")
         a    = m.get("a_pct")
         ratio = ""
         if rp02 and rm:
             try:
-                ratio = f"{float(rp02)/float(rm):.2f}"
+                ratio = f"{_to_float(rp02) / _to_float(rm):.2f}"
             except Exception:
                 pass
         coil_id = _blank(c.get("coil_no") or c.get("cast_no"))
         rows.append([
-            _p(coil_id,                              S_TD_LB),
-            _p(m.get("dir", "L"),                   S_TD_C),
-            _p(_blank(m.get("cond", "")),           S_TD_C),
-            _p(str(rp02) if rp02 else "–",          S_TD_RB),
-            _p(str(rm)   if rm   else "–",          S_TD_RB),
-            _p(_fmt(a, 1) if a is not None else "–", S_TD_R),
-            _p(ratio or "–",                        S_TD_MUT),
-            _p(_blank(m.get("bend", "")),           S_TD_C),
+            _p(coil_id,                                    S_TD_LB),
+            _p(_blank(m.get("dir", "")),                  S_TD_C),
+            _p(_blank(m.get("cond", "")),                 S_TD_C),
+            _p(_blank(rp02),                              S_TD_RB),
+            _p(_blank(rm),                                S_TD_RB),
+            _p(_fmt(_to_float(a), 1) if a else "–",       S_TD_R),
+            _p(ratio or "–",                              S_TD_MUT),
+            _p(_blank(m.get("bend", "")),                 S_TD_C),
             _p(_blank(c.get("coating", "") or c.get("coating_g_m2", "")), S_TD_MUT),
         ])
 
@@ -466,7 +477,11 @@ def _declaration(parsed_cert, mill_cert_no, vs_cert_no, issue_date):
         "tested and inspected in accordance with the order and the applicable standard, "
         "and that the results comply with the specification."
     )
-    remarks  = _blank(parsed_cert.get("remarks", ""), "")
+    remarks_raw = parsed_cert.get("remarks", "")
+    if isinstance(remarks_raw, list):
+        remarks = " ".join(str(r) for r in remarks_raw if r)
+    else:
+        remarks = _blank(remarks_raw, "")
     mfr_name = _blank(parsed_cert.get("manufacturer_name", ""), "")
     footnote = f"Composition and results transcribed from mill certificate {mill_cert_no}"
     if mfr_name:
@@ -567,10 +582,15 @@ def generate_certificate(
     ]
 
     # Prefer explicit total; otherwise sum net weights; fall back to gross weights
-    _net_sum   = sum(float(c.get("weight_kg")       or 0) for c in coils)
-    _gross_sum = sum(float(c.get("gross_weight_kg") or 0) for c in coils)
+    # total_net_weight_kg (new schema) or total_weight_kg (old schema)
+    _explicit = (
+        parsed_cert.get("total_net_weight_kg")
+        or parsed_cert.get("total_weight_kg")
+    )
+    _net_sum   = sum(_to_float(c.get("weight_kg"))       for c in coils)
+    _gross_sum = sum(_to_float(c.get("gross_weight_kg")) for c in coils)
     total_weight = (
-        parsed_cert.get("total_weight_kg")
+        _explicit
         or (_net_sum   if _net_sum   > 0 else None)
         or (_gross_sum if _gross_sum > 0 else None)
     )

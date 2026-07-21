@@ -267,14 +267,14 @@ def _odoo_lookup(parsed, po_num):
     try:
         first_coil = (parsed.get("coils") or [{}])[0]
         signals = {
-            "weight_kg":     parsed.get("total_weight_kg"),
+            "weight_kg":     parsed.get("total_net_weight_kg") or parsed.get("total_weight_kg"),
             "grade":         parsed.get("grade", ""),
             "grade_full":    parsed.get("grade_full", ""),
             "material_type": parsed.get("material_type", ""),
             "quality":       parsed.get("quality", ""),
             "coating":       parsed.get("coating", ""),
-            "width_mm":      first_coil.get("width_mm", ""),
-            "thickness_mm":  first_coil.get("thickness_mm", ""),
+            "width_mm":      str(first_coil.get("width_mm", "")),
+            "thickness_mm":  str(first_coil.get("thickness_mm", "")),
         }
         matched_po, score, candidates = odoo.find_po_for_cert(signals)
         if matched_po and score >= 8:
@@ -313,7 +313,7 @@ async def match_cert(request: Request):
         "odoo_data":         odoo_data,
         "cert_number":       parsed.get("cert_number", ""),
         "grade":             parsed.get("grade", ""),
-        "total_weight_kg":   parsed.get("total_weight_kg"),
+        "total_weight_kg":   parsed.get("total_net_weight_kg") or parsed.get("total_weight_kg"),
         "coil_count":        len(parsed.get("coils") or []),
         "needs_slack_input": match_type == "unmatched",
         "warning": (
@@ -383,8 +383,11 @@ async def pending_cert(request: Request):
 
     supplier       = parsed.get("supplier_name") or parsed.get("manufacturer") or "Unknown supplier"
     mill_cert      = parsed.get("cert_number") or parsed.get("mill_cert_number") or "—"
-    weight_kg      = parsed.get("total_weight_kg")
-    weight_str     = f"{weight_kg / 1000:.2f}t" if weight_kg else "—"
+    weight_kg_raw  = parsed.get("total_net_weight_kg") or parsed.get("total_weight_kg")
+    try:
+        weight_str = f"{float(weight_kg_raw) / 1000:.2f}t" if weight_kg_raw else "—"
+    except (TypeError, ValueError):
+        weight_str = str(weight_kg_raw) if weight_kg_raw else "—"
     coils          = len(parsed.get("coils") or [])
     grade          = parsed.get("grade") or parsed.get("material_type") or "—"
     source_file_url = body.get("source_file_url", "")
