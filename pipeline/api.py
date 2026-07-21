@@ -42,7 +42,9 @@ SLACK_SIGNING_SECRET  = os.environ.get("SLACK_SIGNING_SECRET", "")
 SLACK_CHANNEL_ID      = os.environ.get("SLACK_CHANNEL_ID", "")
 PENDING_CERTS_FILE    = os.environ.get("PENDING_CERTS_FILE", "/data/pending_certs.json")
 GDRIVE_FOLDER_ID      = os.environ.get("GDRIVE_FOLDER_ID", "1xPfEoqAN8g2CcooOrTUaZy2W6ogjgHM7")
-GDRIVE_SA_KEY         = os.environ.get("GDRIVE_SA_KEY", "")  # service account JSON string
+GDRIVE_CLIENT_ID      = os.environ.get("GDRIVE_CLIENT_ID", "")
+GDRIVE_CLIENT_SECRET  = os.environ.get("GDRIVE_CLIENT_SECRET", "")
+GDRIVE_REFRESH_TOKEN  = os.environ.get("GDRIVE_REFRESH_TOKEN", "")
 
 
 @app.on_event("startup")
@@ -164,24 +166,29 @@ def _slack_upload_pdf(pdf_bytes: bytes, filename: str, channel_id: str,
 
 def _gdrive_upload_pdf(pdf_bytes: bytes, filename: str) -> str:
     """
-    Upload a PDF to the configured GDrive folder using a service account.
+    Upload a PDF to the configured GDrive folder using OAuth credentials
+    (support@vanillasteel.com account via stored refresh token).
     Returns the webViewLink of the uploaded file.
-    Requires env vars: GDRIVE_SA_KEY (service account JSON string), GDRIVE_FOLDER_ID.
+    Requires env vars: GDRIVE_CLIENT_ID, GDRIVE_CLIENT_SECRET, GDRIVE_REFRESH_TOKEN, GDRIVE_FOLDER_ID.
     """
-    if not GDRIVE_SA_KEY:
-        raise RuntimeError("GDRIVE_SA_KEY not set — cannot upload to Drive")
+    if not all([GDRIVE_CLIENT_ID, GDRIVE_CLIENT_SECRET, GDRIVE_REFRESH_TOKEN]):
+        raise RuntimeError("GDRIVE_CLIENT_ID / GDRIVE_CLIENT_SECRET / GDRIVE_REFRESH_TOKEN not set")
     if not GDRIVE_FOLDER_ID:
         raise RuntimeError("GDRIVE_FOLDER_ID not set — cannot upload to Drive")
 
-    from google.oauth2 import service_account
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request
     from googleapiclient.discovery import build
     from googleapiclient.http import MediaIoBaseUpload
 
-    sa_info = json.loads(GDRIVE_SA_KEY)
-    creds   = service_account.Credentials.from_service_account_info(
-        sa_info,
-        scopes=["https://www.googleapis.com/auth/drive.file"],
+    creds = Credentials(
+        token=None,
+        refresh_token=GDRIVE_REFRESH_TOKEN,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=GDRIVE_CLIENT_ID,
+        client_secret=GDRIVE_CLIENT_SECRET,
     )
+    creds.refresh(Request())
     service = build("drive", "v3", credentials=creds, cache_discovery=False)
 
     file_metadata = {"name": filename, "parents": [GDRIVE_FOLDER_ID]}
