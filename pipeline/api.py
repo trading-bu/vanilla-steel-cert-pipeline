@@ -17,6 +17,7 @@ Slack interactive flow (no PO on cert):
 - Persistent storage: JSON file at PENDING_CERTS_FILE (default /data/pending_certs.json)
   Requires a Railway Volume mounted at /data to survive restarts.
 """
+import io
 import os
 import re
 import json
@@ -40,6 +41,8 @@ SLACK_BOT_TOKEN       = os.environ.get("SLACK_BOT_TOKEN", "")
 SLACK_SIGNING_SECRET  = os.environ.get("SLACK_SIGNING_SECRET", "")
 SLACK_CHANNEL_ID      = os.environ.get("SLACK_CHANNEL_ID", "")
 PENDING_CERTS_FILE    = os.environ.get("PENDING_CERTS_FILE", "/data/pending_certs.json")
+GDRIVE_FOLDER_ID      = os.environ.get("GDRIVE_FOLDER_ID", "1xPfEoqAN8g2CcooOrTUaZy2W6ogjgHM7")
+GDRIVE_SA_KEY         = os.environ.get("GDRIVE_SA_KEY", "")  # service account JSON string
 
 
 @app.on_event("startup")
@@ -109,13 +112,25 @@ def _slack_api(method: str, data: dict) -> dict:
         return json.loads(resp.read())
 
 
+def _slack_form_api(method: str, data: dict) -> dict:
+    """Slack API call with form-encoded body (required by files.getUploadURLExternal)."""
+    url     = f"https://slack.com/api/{method}"
+    payload = urllib.parse.urlencode(data).encode()
+    req = urllib.request.Request(url, data=payload, headers={
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
+    })
+    with urllib.request.urlopen(req) as resp:
+        return json.loads(resp.read())
+
+
 def _slack_upload_pdf(pdf_bytes: bytes, filename: str, channel_id: str,
                       thread_ts: str, comment: str):
     """Upload a PDF to Slack using the v2 external upload API."""
-    # Step 1: get upload URL
-    url_resp = _slack_api("files.getUploadURLExternal", {
+    # Step 1: get upload URL — must use form-encoded, not JSON
+    url_resp = _slack_form_api("files.getUploadURLExternal", {
         "filename": filename,
-        "length": len(pdf_bytes),
+        "length":   len(pdf_bytes),
     })
     if not url_resp.get("ok"):
         raise RuntimeError(f"files.getUploadURLExternal failed: {url_resp.get('error')}")
@@ -123,7 +138,7 @@ def _slack_upload_pdf(pdf_bytes: bytes, filename: str, channel_id: str,
     upload_url = url_resp["upload_url"]
     file_id    = url_resp["file_id"]
 
-    # Step 2: PUT bytes to the pre-signed URL
+    # Step 2: POST bytes to the pre-signed URL
     put_req = urllib.request.Request(
         upload_url, data=pdf_bytes, method="POST",
         headers={"Content-Type": "application/octet-stream"},
@@ -141,6 +156,45 @@ def _slack_upload_pdf(pdf_bytes: bytes, filename: str, channel_id: str,
         complete_data["thread_ts"] = thread_ts
 
     _slack_api("files.completeUploadExternal", complete_data)
+
+
+# ---------------------------------------------------------------------------
+# Google Drive upload
+# ---------------------------------------------------------------------------
+
+def _gdrive_upload_pdf(pdf_bytes: bytes, filename: str) -> str:
+    """
+    Upload a PDF to the configured GDrive folder using a service account.
+    Returns the webViewLink of the uploaded file.
+    Requires env vars: GDRIVE_SA_KEY (service account JSON string), GDRIVE_FOLDER_ID.
+    """
+    if not GDRIVE_SA_KEY:
+        raise RuntimeError("GDRIVE_SA_KEY not set — cannot upload to Drive")
+    if not GDRIVE_FOLDER_ID:
+        raise RuntimeError("GDRIVE_FOLDER_ID not set — cannot upload to Drive")
+
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaIoBaseUpload
+
+    sa_info = json.loads(GDRIVE_SA_KEY)
+    creds   = service_account.Credentials.from_service_account_info(
+        sa_info,
+        scopes=["https://www.googleapis.com/auth/drive.file"],
+    )
+    service = build("drive", "v3", credentials=creds, cache_discovery=False)
+
+    file_metadata = {"name": filename, "parents": [GDRIVE_FOLDER_ID]}
+    media = MediaIoBaseUpload(io.BytesIO(pdf_bytes), mimetype="application/pdf")
+    result = service.files().create(
+        body=file_metadata,
+        media_body=media,
+        fields="id,name,webViewLink",
+    ).execute()
+
+    link = result.get("webViewLink", "")
+    print(f"[Drive] Uploaded '{filename}' → {link}")
+    return link
 
 
 # ---------------------------------------------------------------------------
@@ -477,25 +531,37 @@ async def slack_interactive(request: Request):
                 "errors": {"po_block": f"PDF generation failed: {exc}"},
             }
 
-        # Upload PDF to Slack thread
-        supplier = cert_data.get("supplier_name") or cert_data.get("manufacturer") or "cert"
-        so_num   = odoo_data.get("so_number", "")
-        filename = f"neutralised_{supplier.replace(' ', '_')}_{po_num}.pdf"
-        comment  = (
-            f"✅ *Neutralised cert generated*\n"
-            f"PO: `{po_num}` · SO: `{so_num}` · Match score: {score}"
-        )
+        # Upload PDF to Google Drive, then post Slack confirmation
+        supplier     = cert_data.get("supplier_name") or cert_data.get("manufacturer") or "cert"
+        so_num       = odoo_data.get("so_number", "")
+        cert_date_raw = cert_data.get("cert_date") or ""
+        cert_date    = cert_date_raw.replace("/", "-").replace(".", "-")
+        filename     = f"{cert_date}_{so_num}_{po_num}.pdf".lstrip("_-")
 
+        drive_link = ""
         try:
-            _slack_upload_pdf(pdf_bytes, filename, channel_id, message_ts, comment)
+            drive_link = _gdrive_upload_pdf(pdf_bytes, filename)
         except Exception as exc:
-            print(f"[Slack] PDF upload failed: {exc}")
-            # Still close the modal — cert was generated, just notify in thread
-            _slack_api("chat.postMessage", {
-                "channel":   channel_id,
-                "thread_ts": message_ts,
-                "text":      f"✅ Cert generated (PO `{po_num}`, SO `{so_num}`) but PDF upload failed: {exc}",
-            })
+            print(f"[Drive] Upload failed: {exc}")
+
+        # Post confirmation to Slack thread
+        if drive_link:
+            slack_text = (
+                f"✅ *Neutralised cert uploaded to Google Drive*\n"
+                f"PO: `{po_num}` · SO: `{so_num}`\n"
+                f"<{drive_link}|Open in Drive>"
+            )
+        else:
+            slack_text = (
+                f"✅ *Neutralised cert generated* (Drive upload failed — check Railway logs)\n"
+                f"PO: `{po_num}` · SO: `{so_num}`"
+            )
+
+        _slack_api("chat.postMessage", {
+            "channel":   channel_id,
+            "thread_ts": message_ts,
+            "text":      slack_text,
+        })
 
         # Close the modal
         return {"response_action": "clear"}
