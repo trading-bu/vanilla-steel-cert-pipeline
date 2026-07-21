@@ -221,60 +221,43 @@ def get_neutralisation_data(vs_po_number: str) -> dict:
     """
     print(f"[Odoo] Looking up data for PO: {vs_po_number}")
 
-    # 1. Find the purchase order.
-    #    VS PO numbers (P0XXXX) are the name of vs.deal records.
-    #    vs.deal has a purchase_order_id many2one → purchase.order.
-    #    So: search vs.deal by name → get the linked purchase.order id.
-    po_id   = None
-    po_name = None
-
-    deal_records = _call(
-        "vs.deal", "search_read",
+    # 1. Find the purchase order by name (purchase.order.name = "P01791" etc.)
+    po_records = _call(
+        "purchase.order", "search_read",
         [[["name", "=", vs_po_number]]],
-        {"fields": ["id", "name", "purchase_order_id"], "limit": 1}
+        {"fields": ["id", "name"], "limit": 1}
     )
-    if deal_records:
-        deal = deal_records[0]
-        print(f"[Odoo] Found vs.deal: id={deal['id']} name={deal['name']} "
-              f"purchase_order_id={deal.get('purchase_order_id')}")
-        if deal.get("purchase_order_id"):
-            po_id   = deal["purchase_order_id"][0]
-            po_name = deal["purchase_order_id"][1]
-    else:
-        print(f"[Odoo] No vs.deal found for name='{vs_po_number}', trying purchase.order.name directly.")
+    if not po_records:
+        raise ValueError(f"No purchase order found in Odoo for '{vs_po_number}'")
 
-    # Fallback: search purchase.order by name directly
-    if not po_id:
-        po_records_fallback = _call(
-            "purchase.order", "search_read",
-            [[["name", "=", vs_po_number]]],
-            {"fields": ["id", "name"], "limit": 1}
+    po_id   = po_records[0]["id"]
+    po_name = po_records[0]["name"]
+    print(f"[Odoo] Found PO id={po_id} name={po_name}")
+
+    # 2. Get all purchase order lines.
+    #    Start with fields confirmed to exist, then try optional custom fields.
+    _SAFE_LINE_FIELDS = [
+        "id", "vs_article", "aoo_fast_number",
+        "original_supplier_article", "sale_line_id",
+        "product_uom_qty", "name", "product_id",
+    ]
+    _OPTIONAL_LINE_FIELDS = [
+        "grade", "choice", "form", "finish", "coating", "width", "thickness",
+    ]
+    # Try with all fields first; fall back to safe-only if Odoo rejects unknown fields
+    try:
+        po_lines = _call(
+            "purchase.order.line", "search_read",
+            [[["order_id", "=", po_id]]],
+            {"fields": _SAFE_LINE_FIELDS + _OPTIONAL_LINE_FIELDS}
         )
-        if po_records_fallback:
-            po_id   = po_records_fallback[0]["id"]
-            po_name = po_records_fallback[0]["name"]
-            print(f"[Odoo] Found PO by name: id={po_id} name={po_name}")
-
-    if not po_id:
-        raise ValueError(
-            f"No record found in Odoo for '{vs_po_number}'. "
-            f"Searched vs.deal.name and purchase.order.name."
+    except Exception:
+        print("[Odoo] WARNING: Some PO line fields unavailable, retrying with safe fields only.")
+        po_lines = _call(
+            "purchase.order.line", "search_read",
+            [[["order_id", "=", po_id]]],
+            {"fields": _SAFE_LINE_FIELDS}
         )
-
-    print(f"[Odoo] Using PO id={po_id} name={po_name}")
-
-    # 2. Get all purchase order lines with per-item weight and product info
-    po_lines = _call(
-        "purchase.order.line", "search_read",
-        [[["order_id", "=", po_id]]],
-        {"fields": [
-            "id", "vs_article", "aoo_fast_number",
-            "original_supplier_article", "sale_line_id",
-            "product_uom_qty", "name", "product_id",
-            "grade", "choice", "form", "finish", "coating",
-            "width", "thickness",
-        ]}
-    )
 
     # Batch-fetch product details for grade / dimensions.
     # product_id is a many2one field → [id, display_name].
