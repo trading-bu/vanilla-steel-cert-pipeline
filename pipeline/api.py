@@ -36,7 +36,8 @@ from pdf_generator import generate_certificate
 app = FastAPI(title="VS Cert Generator")
 
 ODOO_API_KEY          = os.environ.get("ODOO_API_KEY", "")
-LOGO_PATH             = os.environ.get("LOGO_PATH", "")
+LOGO_PATH             = os.environ.get("LOGO_PATH", "")   # legacy, unused by v3 generator
+FONT_DIR              = os.environ.get("FONT_DIR", "") or None  # HankenGrotesk TTFs (optional)
 SLACK_BOT_TOKEN       = os.environ.get("SLACK_BOT_TOKEN", "")
 SLACK_SIGNING_SECRET  = os.environ.get("SLACK_SIGNING_SECRET", "")
 SLACK_CHANNEL_ID      = os.environ.get("SLACK_CHANNEL_ID", "")
@@ -161,6 +162,93 @@ def _slack_upload_pdf(pdf_bytes: bytes, filename: str, channel_id: str,
 
 
 # ---------------------------------------------------------------------------
+# Schema helpers (v2 extraction schema sends weights/dims as strings)
+# ---------------------------------------------------------------------------
+
+def _to_float(v) -> float:
+    """'46340', '46.340,5', 46340, None → float. Never raises."""
+    if v is None or v is False:
+        return 0.0
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = str(v).strip()
+    if not s:
+        return 0.0
+    if "," in s and "." in s:
+        s = s.replace(".", "").replace(",", ".")
+    elif "," in s:
+        s = s.replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
+
+
+def _cert_total_weight_kg(parsed: dict) -> float:
+    """Best-effort cert total: explicit totals first, else sum of coil weights."""
+    total = _to_float(parsed.get("total_net_weight_kg")) \
+        or _to_float(parsed.get("total_gross_weight_kg")) \
+        or _to_float(parsed.get("total_weight_kg"))
+    if total:
+        return total
+    coils = parsed.get("coils") or []
+    net   = sum(_to_float(c.get("weight_kg")) for c in coils)
+    gross = sum(_to_float(c.get("gross_weight_kg")) for c in coils)
+    return net or gross
+
+
+_GERMANY_NAMES = {"germany", "deutschland", "de", "bundesrepublik deutschland"}
+
+
+def _decide_language(parsed: dict, odoo_data: dict) -> str:
+    """
+    v7 rule: German output ONLY when the source cert is German AND the buyer
+    (Country of Destination from Odoo) is in Germany. All other cases English.
+    """
+    cert_lang = str(parsed.get("cert_language") or "").strip().lower()
+    buyer     = str(odoo_data.get("buyer_country") or "").strip().lower()
+    if cert_lang.startswith("de") and buyer in _GERMANY_NAMES:
+        return "de"
+    return "en"
+
+
+# ---------------------------------------------------------------------------
+# vs_articles normalisation
+# ---------------------------------------------------------------------------
+
+def _normalise_vs_articles(odoo_data: dict) -> dict:
+    """
+    pdf_generator v3 expects vs_articles as {coil_no: "VSI-XXXX"}.
+    odoo_client returns a list of dicts with original_supplier_article + vs_article.
+    Convert list → dict keyed by original_supplier_article (== cert coil_no).
+    Falls back to {"*": first_vs_article} when only one article exists.
+    """
+    raw = odoo_data.get("vs_articles") or []
+    if isinstance(raw, dict):
+        return odoo_data  # already correct format
+    if not isinstance(raw, list) or not raw:
+        return odoo_data
+
+    art_map = {}
+    for art in raw:
+        osa = (art.get("original_supplier_article") or "").strip()
+        va  = (art.get("vs_article") or "").strip()
+        if va:
+            if osa:
+                art_map[osa] = va
+            else:
+                art_map.setdefault("*", va)
+
+    # If we couldn't key by coil, fall back to wildcard
+    if not art_map and raw:
+        va = (raw[0].get("vs_article") or "").strip()
+        if va:
+            art_map = {"*": va}
+
+    return {**odoo_data, "vs_articles": art_map}
+
+
+# ---------------------------------------------------------------------------
 # Google Drive upload
 # ---------------------------------------------------------------------------
 
@@ -267,7 +355,8 @@ def _odoo_lookup(parsed, po_num):
     try:
         first_coil = (parsed.get("coils") or [{}])[0]
         signals = {
-            "weight_kg":     parsed.get("total_net_weight_kg") or parsed.get("total_weight_kg"),
+            # float, with fallback to summed coil weights (v2 schema sends strings)
+            "weight_kg":     _cert_total_weight_kg(parsed),
             "grade":         parsed.get("grade", ""),
             "grade_full":    parsed.get("grade_full", ""),
             "material_type": parsed.get("material_type", ""),
@@ -313,7 +402,8 @@ async def match_cert(request: Request):
         "odoo_data":         odoo_data,
         "cert_number":       parsed.get("cert_number", ""),
         "grade":             parsed.get("grade", ""),
-        "total_weight_kg":   parsed.get("total_net_weight_kg") or parsed.get("total_weight_kg"),
+        # robust across v1/v2 schemas; falls back to summed coil weights
+        "total_weight_kg":   _cert_total_weight_kg(parsed) or None,
         "coil_count":        len(parsed.get("coils") or []),
         "needs_slack_input": match_type == "unmatched",
         "warning": (
@@ -345,11 +435,23 @@ async def generate(request: Request):
 
     odoo_data, match_type, score = _odoo_lookup(parsed, po_num)
 
+    # v3 generator requires a Sales Order — fail cleanly and routably instead
+    # of a generic 500 so Make can send this to the pending/Slack flow.
+    if match_type == "unmatched" or not odoo_data.get("so_number"):
+        raise HTTPException(
+            status_code=422,
+            detail="No Odoo match found (no Sales Order). "
+                   "Send this cert to /pending-cert or supply a valid VS PO number.",
+        )
+
+    language = _decide_language(parsed, odoo_data)
+
     try:
         pdf_bytes = generate_certificate(
             parsed_cert=parsed,
-            odoo_data=odoo_data,
-            logo_path=LOGO_PATH or None,
+            odoo_data=_normalise_vs_articles(odoo_data),
+            language=language,
+            font_dir=FONT_DIR,
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail="PDF generation failed: %s" % exc)
@@ -358,9 +460,10 @@ async def generate(request: Request):
         content=pdf_bytes,
         media_type="application/pdf",
         headers={
-            "X-Match-Type":  match_type,
-            "X-Match-Score": str(score),
-            "X-SO-Number":   odoo_data.get("so_number", ""),
+            "X-Match-Type":   match_type,
+            "X-Match-Score":  str(score),
+            "X-SO-Number":    odoo_data.get("so_number", ""),
+            "X-Language":     language,
         },
     )
 
@@ -381,13 +484,10 @@ async def pending_cert(request: Request):
     cert_id  = str(uuid.uuid4())
     _store_cert(cert_id, parsed)
 
-    supplier       = parsed.get("supplier_name") or parsed.get("manufacturer") or "Unknown supplier"
+    supplier       = parsed.get("supplier_name") or parsed.get("manufacturer_name") or parsed.get("manufacturer") or "Unknown supplier"
     mill_cert      = parsed.get("cert_number") or parsed.get("mill_cert_number") or "—"
-    weight_kg_raw  = parsed.get("total_net_weight_kg") or parsed.get("total_weight_kg")
-    try:
-        weight_str = f"{float(weight_kg_raw) / 1000:.2f}t" if weight_kg_raw else "—"
-    except (TypeError, ValueError):
-        weight_str = str(weight_kg_raw) if weight_kg_raw else "—"
+    weight_kg      = _cert_total_weight_kg(parsed)
+    weight_str     = f"{weight_kg / 1000:.2f}t" if weight_kg else "—"
     coils          = len(parsed.get("coils") or [])
     grade          = parsed.get("grade") or parsed.get("material_type") or "—"
     source_file_url = body.get("source_file_url", "")
@@ -531,12 +631,14 @@ async def slack_interactive(request: Request):
                 "errors": {"po_block": f"Odoo error for {po_num}: {err_msg}"},
             }
 
-        # Generate PDF
+        # Generate PDF — same pipeline as /generate-cert (v7 language rule)
         try:
+            language = _decide_language(cert_data, odoo_data)
             pdf_bytes = generate_certificate(
                 parsed_cert=cert_data,
-                odoo_data=odoo_data,
-                logo_path=LOGO_PATH or None,
+                odoo_data=_normalise_vs_articles(odoo_data),
+                language=language,
+                font_dir=FONT_DIR,
             )
         except Exception as exc:
             _store_cert(cert_id, cert_data)

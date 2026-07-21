@@ -2,14 +2,16 @@
 Odoo XML-RPC client for the certificate neutralisation pipeline.
 Looks up Sales Order, buyer country, and VS article numbers from a VS PO number.
 """
+import os
 import re
 import xmlrpc.client
 from datetime import datetime, timedelta
 
-ODOO_URL      = "https://erp.ops.vanillasteel.com"
-ODOO_DB       = "vanillasteel-main-22503126"
-ODOO_LOGIN    = "mridul.goel@vanillasteel.com"
-ODOO_API_KEY  = None   # Set via environment variable
+# Overridable via env vars; defaults preserve current behaviour.
+ODOO_URL      = os.environ.get("ODOO_URL",   "https://erp.ops.vanillasteel.com")
+ODOO_DB       = os.environ.get("ODOO_DB",    "vanillasteel-main-22503126")
+ODOO_LOGIN    = os.environ.get("ODOO_LOGIN", "mridul.goel@vanillasteel.com")
+ODOO_API_KEY  = os.environ.get("ODOO_API_KEY") or None   # or via set_api_key()
 
 _uid    = None
 _models = None
@@ -60,6 +62,27 @@ _FORM_NORM = {
 
 def _norm(s: str) -> str:
     return re.sub(r"[\s\-_\.\/]+", "", (s or "")).upper()
+
+
+def _f(v) -> float:
+    """Robust float: accepts numbers, '46340', '46340.5', '46.340,5' (German),
+    None/''/False → 0.0. v2 extraction schema sends weights/dims as strings."""
+    if v is None or v is False:
+        return 0.0
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = str(v).strip()
+    if not s:
+        return 0.0
+    # German format: dot thousands + comma decimal → normalise
+    if "," in s and "." in s:
+        s = s.replace(".", "").replace(",", ".")
+    elif "," in s:
+        s = s.replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
 
 
 def _spec_tokens(s: str) -> set:
@@ -152,8 +175,10 @@ def _score_line(line: dict, cert: dict) -> int:
     score = 0
 
     # ── Weight — max 5 pts ────────────────────────────────────────────────
-    odoo_kg = (line.get("weight_t") or 0) * 1000
-    cert_kg = cert.get("weight_kg") or 0
+    # _f() coerces v2-schema string weights ('46340', '46.340,5') safely;
+    # a raw string here previously raised TypeError and killed auto-match.
+    odoo_kg = _f(line.get("weight_t")) * 1000
+    cert_kg = _f(cert.get("weight_kg"))
     if odoo_kg > 0 and cert_kg > 0:
         pct = abs(odoo_kg - cert_kg) / odoo_kg
         if   pct <= 0.02: score += 5
@@ -190,22 +215,16 @@ def _score_line(line: dict, cert: dict) -> int:
         score += 1
 
     # ── Width — max 2 pts ─────────────────────────────────────────────────
-    try:
-        ow = float(line.get("width_mm") or 0)
-        cw = float(cert.get("width_mm") or 0)
-        if ow > 0 and cw > 0 and abs(ow - cw) <= 2:
-            score += 2
-    except (ValueError, TypeError):
-        pass
+    ow = _f(line.get("width_mm"))
+    cw = _f(cert.get("width_mm"))
+    if ow > 0 and cw > 0 and abs(ow - cw) <= 2:
+        score += 2
 
     # ── Thickness — max 2 pts ─────────────────────────────────────────────
-    try:
-        ot = float(line.get("thickness_mm") or 0)
-        ct = float(cert.get("thickness_mm") or 0)
-        if ot > 0 and ct > 0 and abs(ot - ct) <= 0.1:
-            score += 2
-    except (ValueError, TypeError):
-        pass
+    ot = _f(line.get("thickness_mm"))
+    ct = _f(cert.get("thickness_mm"))
+    if ot > 0 and ct > 0 and abs(ot - ct) <= 0.1:
+        score += 2
 
     return score
 
