@@ -381,12 +381,15 @@ async def pending_cert(request: Request):
     cert_id  = str(uuid.uuid4())
     _store_cert(cert_id, parsed)
 
-    supplier  = parsed.get("supplier_name") or parsed.get("manufacturer") or "Unknown supplier"
-    mill_cert = parsed.get("cert_number") or parsed.get("mill_cert_number") or "—"
-    weight_kg = parsed.get("total_weight_kg")
-    weight_str = f"{weight_kg / 1000:.2f}t" if weight_kg else "—"
-    coils     = len(parsed.get("coils") or [])
-    grade     = parsed.get("grade") or parsed.get("material_type") or "—"
+    supplier       = parsed.get("supplier_name") or parsed.get("manufacturer") or "Unknown supplier"
+    mill_cert      = parsed.get("cert_number") or parsed.get("mill_cert_number") or "—"
+    weight_kg      = parsed.get("total_weight_kg")
+    weight_str     = f"{weight_kg / 1000:.2f}t" if weight_kg else "—"
+    coils          = len(parsed.get("coils") or [])
+    grade          = parsed.get("grade") or parsed.get("material_type") or "—"
+    source_file_url = body.get("source_file_url", "")
+
+    source_line = f"\n<{source_file_url}|View original cert in Drive>" if source_file_url else ""
 
     result = _slack_api("chat.postMessage", {
         "channel": SLACK_CHANNEL_ID,
@@ -400,7 +403,8 @@ async def pending_cert(request: Request):
                         f"*Supplier:* {supplier}\n"
                         f"*Mill cert no:* {mill_cert}\n"
                         f"*Total weight:* {weight_str}  |  *Coils:* {coils}\n"
-                        f"*Grade:* {grade}\n\n"
+                        f"*Grade:* {grade}"
+                        f"{source_line}\n\n"
                         f"Please enter the VS PO number to continue processing."
                     ),
                 },
