@@ -333,6 +333,15 @@ def _normalise_po(s: str) -> str:
 # Odoo lookup
 # ---------------------------------------------------------------------------
 
+def _odoo_grade(odoo_data: dict) -> str:
+    """First non-empty grade from Odoo vs_articles (PO-line source of truth)."""
+    for art in (odoo_data.get("vs_articles") or []):
+        g = str(art.get("grade") or "").strip()
+        if g:
+            return g
+    return ""
+
+
 def _odoo_lookup(parsed, po_num):
     """
     Returns (odoo_data, match_type, match_score).
@@ -427,12 +436,9 @@ async def generate(request: Request):
             status_code=422,
             detail="Extraction returned no coils. Check the Claude prompt or the source PDF.",
         )
-    if not parsed.get("grade") and not parsed.get("material_type"):
-        raise HTTPException(
-            status_code=422,
-            detail="Extraction returned no grade or material type. Cert may need manual processing.",
-        )
 
+    # Odoo lookup FIRST — the PO line is the source of truth for grade/spec,
+    # so we can recover a grade even when the supplier cert leaves it blank.
     odoo_data, match_type, score = _odoo_lookup(parsed, po_num)
 
     # v3 generator requires a Sales Order — fail cleanly and routably instead
@@ -443,6 +449,20 @@ async def generate(request: Request):
             detail="No Odoo match found (no Sales Order). "
                    "Send this cert to /pending-cert or supply a valid VS PO number.",
         )
+
+    # Backfill grade from Odoo when the supplier cert states none (e.g. EMW
+    # certs identify material only by an internal Materialnummer, blank "Güte").
+    if not parsed.get("grade") and not parsed.get("grade_full") and not parsed.get("material_type"):
+        odoo_grade = _odoo_grade(odoo_data)
+        if odoo_grade:
+            parsed["grade"] = odoo_grade
+            parsed.setdefault("grade_full", odoo_grade)
+            print("[grade] Backfilled from Odoo vs_articles: %s" % odoo_grade)
+
+    if not parsed.get("grade") and not parsed.get("material_type"):
+        # Neither the cert nor Odoo has a grade — proceed anyway and leave the
+        # grade blank in the output PDF (per requirement).
+        print("[grade] No grade on cert or in Odoo; leaving blank in output.")
 
     language = _decide_language(parsed, odoo_data)
 
