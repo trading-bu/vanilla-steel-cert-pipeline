@@ -221,26 +221,47 @@ def get_neutralisation_data(vs_po_number: str) -> dict:
     """
     print(f"[Odoo] Looking up data for PO: {vs_po_number}")
 
-    # 1. Find the purchase order — try purchase_order_id field first (VS internal PO ref),
-    #    fall back to name field.
-    po_records = _call(
-        "purchase.order", "search_read",
-        [[["purchase_order_id", "=", vs_po_number]]],
+    # 1. Find the purchase order.
+    #    VS PO numbers (P0XXXX) are the name of vs.deal records.
+    #    vs.deal has a purchase_order_id many2one → purchase.order.
+    #    So: search vs.deal by name → get the linked purchase.order id.
+    po_id   = None
+    po_name = None
+
+    deal_records = _call(
+        "vs.deal", "search_read",
+        [[["name", "=", vs_po_number]]],
         {"fields": ["id", "name", "purchase_order_id"], "limit": 1}
     )
-    if not po_records:
-        # Fallback: try by Odoo name field
-        po_records = _call(
+    if deal_records:
+        deal = deal_records[0]
+        print(f"[Odoo] Found vs.deal: id={deal['id']} name={deal['name']} "
+              f"purchase_order_id={deal.get('purchase_order_id')}")
+        if deal.get("purchase_order_id"):
+            po_id   = deal["purchase_order_id"][0]
+            po_name = deal["purchase_order_id"][1]
+    else:
+        print(f"[Odoo] No vs.deal found for name='{vs_po_number}', trying purchase.order.name directly.")
+
+    # Fallback: search purchase.order by name directly
+    if not po_id:
+        po_records_fallback = _call(
             "purchase.order", "search_read",
             [[["name", "=", vs_po_number]]],
-            {"fields": ["id", "name", "purchase_order_id"], "limit": 1}
+            {"fields": ["id", "name"], "limit": 1}
         )
-    if not po_records:
-        raise ValueError(f"No purchase order found in Odoo for '{vs_po_number}' (searched purchase_order_id and name)")
+        if po_records_fallback:
+            po_id   = po_records_fallback[0]["id"]
+            po_name = po_records_fallback[0]["name"]
+            print(f"[Odoo] Found PO by name: id={po_id} name={po_name}")
 
-    po = po_records[0]
-    po_id = po["id"]
-    print(f"[Odoo] Found PO id={po_id}")
+    if not po_id:
+        raise ValueError(
+            f"No record found in Odoo for '{vs_po_number}'. "
+            f"Searched vs.deal.name and purchase.order.name."
+        )
+
+    print(f"[Odoo] Using PO id={po_id} name={po_name}")
 
     # 2. Get all purchase order lines with per-item weight and product info
     po_lines = _call(
